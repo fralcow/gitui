@@ -5,23 +5,24 @@ pub mod merge_ff;
 pub mod merge_rebase;
 pub mod rename;
 
-use std::collections::HashSet;
-
 use super::{
 	remotes::get_default_remote_in_repo, utils::bytes2string,
+	RepoPath,
 };
 use crate::{
 	error::{Error, Result},
-	sync::{utils, CommitId},
+	sync::{repository::repo, utils::get_head_repo, CommitId},
 };
 use git2::{Branch, BranchType, Repository};
 use scopetime::scope_time;
-use utils::get_head_repo;
+use std::collections::HashSet;
 
 /// returns the branch-name head is currently pointing to
 /// this might be expensive, see `cached::BranchName`
-pub(crate) fn get_branch_name(repo_path: &str) -> Result<String> {
-	let repo = utils::repo(repo_path)?;
+pub(crate) fn get_branch_name(
+	repo_path: &RepoPath,
+) -> Result<String> {
+	let repo = repo(repo_path)?;
 
 	get_branch_name_repo(&repo)
 }
@@ -47,25 +48,34 @@ pub(crate) fn get_branch_name_repo(
 }
 
 ///
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocalBranch {
 	///
 	pub is_head: bool,
 	///
 	pub has_upstream: bool,
 	///
+	pub upstream: Option<UpstreamBranch>,
+	///
 	pub remote: Option<String>,
 }
 
 ///
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct UpstreamBranch {
+	///
+	pub reference: String,
+}
+
+///
+#[derive(Clone, Debug)]
 pub struct RemoteBranch {
 	///
 	pub has_tracking: bool,
 }
 
 ///
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum BranchDetails {
 	///
 	Local(LocalBranch),
@@ -74,7 +84,7 @@ pub enum BranchDetails {
 }
 
 ///
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BranchInfo {
 	///
 	pub name: String,
@@ -111,12 +121,12 @@ pub fn validate_branch_name(name: &str) -> Result<bool> {
 /// returns a list of `BranchInfo` with a simple summary on each branch
 /// `local` filters for local branches otherwise remote branches will be returned
 pub fn get_branches_info(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	local: bool,
 ) -> Result<Vec<BranchInfo>> {
 	scope_time!("get_branches_info");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 
 	let (filter, remotes_with_tracking) = if local {
 		(BranchType::Local, HashSet::default())
@@ -153,10 +163,18 @@ pub fn get_branches_info(
 
 			let name_bytes = branch.name_bytes()?;
 
+			let upstream_branch =
+				upstream.ok().and_then(|upstream| {
+					bytes2string(upstream.get().name_bytes())
+						.ok()
+						.map(|reference| UpstreamBranch { reference })
+				});
+
 			let details = if local {
 				BranchDetails::Local(LocalBranch {
 					is_head: branch.is_head(),
-					has_upstream: upstream.is_ok(),
+					has_upstream: upstream_branch.is_some(),
+					upstream: upstream_branch,
 					remote,
 				})
 			} else {
@@ -240,7 +258,7 @@ pub(crate) fn branch_set_upstream(
 
 	if branch.upstream().is_err() {
 		let remote = get_default_remote_in_repo(repo)?;
-		let upstream_name = format!("{}/{}", remote, branch_name);
+		let upstream_name = format!("{remote}/{branch_name}");
 		branch.set_upstream(Some(upstream_name.as_str()))?;
 	}
 
@@ -249,10 +267,10 @@ pub(crate) fn branch_set_upstream(
 
 /// returns remote of the upstream tracking branch for `branch`
 pub fn get_branch_remote(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	branch: &str,
 ) -> Result<Option<String>> {
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 	let branch = repo.find_branch(branch, BranchType::Local)?;
 	let reference = bytes2string(branch.get().name_bytes())?;
 	let remote_name = repo.branch_upstream_remote(&reference).ok();
@@ -286,8 +304,8 @@ pub fn get_branch_remote_by_ref(
 }
 
 /// returns whether the pull merge strategy is set to rebase
-pub fn config_is_pull_rebase(repo_path: &str) -> Result<bool> {
-	let repo = utils::repo(repo_path)?;
+pub fn config_is_pull_rebase(repo_path: &RepoPath) -> Result<bool> {
+	let repo = repo(repo_path)?;
 	let config = repo.config()?;
 
 	if let Ok(rebase) = config.get_entry("pull.rebase") {
@@ -301,12 +319,12 @@ pub fn config_is_pull_rebase(repo_path: &str) -> Result<bool> {
 
 ///
 pub fn branch_compare_upstream(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	branch: &str,
 ) -> Result<BranchCompare> {
 	scope_time!("branch_compare_upstream");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 
 	let branch = repo.find_branch(branch, BranchType::Local)?;
 
@@ -326,14 +344,14 @@ pub fn branch_compare_upstream(
 
 /// Modify HEAD to point to a branch then checkout head, does not work if there are uncommitted changes
 pub fn checkout_branch(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	branch_ref: &str,
 ) -> Result<()> {
 	scope_time!("checkout_branch");
 
 	// This defaults to a safe checkout, so don't delete anything that
 	// hasn't been committed or stashed, in this case it will Err
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 	let cur_ref = repo.head()?;
 	let statuses = repo.statuses(Some(
 		git2::StatusOptions::new().include_ignored(false),
@@ -357,14 +375,44 @@ pub fn checkout_branch(
 	}
 }
 
+/// Detach HEAD to point to a commit then checkout HEAD, does not work if there are uncommitted changes
+pub fn checkout_commit(
+	repo_path: &RepoPath,
+	commit_hash: CommitId,
+) -> Result<()> {
+	scope_time!("checkout_commit");
+
+	let repo = repo(repo_path)?;
+	let cur_ref = repo.head()?;
+	let statuses = repo.statuses(Some(
+		git2::StatusOptions::new().include_ignored(false),
+	))?;
+
+	if statuses.is_empty() {
+		repo.set_head_detached(commit_hash.into())?;
+
+		if let Err(e) = repo.checkout_head(Some(
+			git2::build::CheckoutBuilder::new().force(),
+		)) {
+			repo.set_head(
+				bytes2string(cur_ref.name_bytes())?.as_str(),
+			)?;
+			return Err(Error::Git(e));
+		}
+		Ok(())
+	} else {
+		Err(Error::UncommittedChanges)
+	}
+}
+
 ///
 pub fn checkout_remote_branch(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	branch: &BranchInfo,
 ) -> Result<()> {
 	scope_time!("checkout_remote_branch");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 	let cur_ref = repo.head()?;
 
 	if !repo
@@ -402,12 +450,12 @@ pub fn checkout_remote_branch(
 
 /// The user must not be on the branch for the branch to be deleted
 pub fn delete_branch(
-	repo_path: &str,
+	repo_path: &RepoPath,
 	branch_ref: &str,
 ) -> Result<()> {
 	scope_time!("delete_branch");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 	let branch_as_ref = repo.find_reference(branch_ref)?;
 	let mut branch = git2::Branch::wrap(branch_as_ref);
 	if branch.is_head() {
@@ -418,10 +466,13 @@ pub fn delete_branch(
 }
 
 /// creates a new branch pointing to current HEAD commit and updating HEAD to new branch
-pub fn create_branch(repo_path: &str, name: &str) -> Result<String> {
+pub fn create_branch(
+	repo_path: &RepoPath,
+	name: &str,
+) -> Result<String> {
 	scope_time!("create_branch");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 
 	let head_id = get_head_repo(&repo)?;
 	let head_commit = repo.find_commit(head_id.into())?;
@@ -443,7 +494,8 @@ mod tests_branch_name {
 	fn test_smoke() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert_eq!(
 			get_branch_name(repo_path).unwrap().as_str(),
@@ -455,7 +507,8 @@ mod tests_branch_name {
 	fn test_empty_repo() {
 		let (_td, repo) = repo_init_empty().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert!(matches!(
 			get_branch_name(repo_path),
@@ -473,7 +526,8 @@ mod tests_create_branch {
 	fn test_smoke() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		create_branch(repo_path, "branch1").unwrap();
 
@@ -493,7 +547,8 @@ mod tests_branch_compare {
 	fn test_smoke() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		create_branch(repo_path, "test").unwrap();
 
@@ -507,7 +562,7 @@ mod tests_branch_compare {
 mod tests_branches {
 	use super::*;
 	use crate::sync::{
-		remotes::{get_remotes, push::push},
+		remotes::{get_remotes, push::push_branch},
 		rename_branch,
 		tests::{
 			debug_cmd_print, repo_clone, repo_init, repo_init_bare,
@@ -519,7 +574,8 @@ mod tests_branches {
 	fn test_smoke() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert_eq!(
 			get_branches_info(repo_path, true)
@@ -535,7 +591,8 @@ mod tests_branches {
 	fn test_multiple() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		create_branch(repo_path, "test").unwrap();
 
@@ -554,9 +611,18 @@ mod tests_branches {
 		let dir = dir.path().to_str().unwrap();
 
 		write_commit_file(&repo, "f1.txt", "foo", "c1");
-		rename_branch(dir, "refs/heads/master", branch_name).unwrap();
-		push(dir, "origin", branch_name, false, false, None, None)
+		rename_branch(&dir.into(), "refs/heads/master", branch_name)
 			.unwrap();
+		push_branch(
+			&dir.into(),
+			"origin",
+			branch_name,
+			false,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
 	}
 
 	#[test]
@@ -573,7 +639,8 @@ mod tests_branches {
 		clone_branch_commit_push(r2_path, "r2branch");
 
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		//add the remotes
 		repo.remote("r1", r1_path).unwrap();
@@ -737,7 +804,8 @@ mod tests_branches {
 	fn test_branch_remote_no_upstream() {
 		let (_r, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert_eq!(
 			get_branch_remote(repo_path, "master").unwrap(),
@@ -749,7 +817,8 @@ mod tests_branches {
 	fn test_branch_remote_no_branch() {
 		let (_r, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert!(get_branch_remote(repo_path, "foo").is_err());
 
@@ -775,7 +844,8 @@ mod tests_checkout {
 	fn test_smoke() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		assert!(
 			checkout_branch(repo_path, "refs/heads/master").is_ok()
@@ -789,7 +859,8 @@ mod tests_checkout {
 	fn test_multiple() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		create_branch(repo_path, "test").unwrap();
 
@@ -802,6 +873,33 @@ mod tests_checkout {
 }
 
 #[cfg(test)]
+mod tests_checkout_commit {
+	use super::*;
+	use crate::sync::tests::{repo_init, write_commit_file};
+	use crate::sync::RepoPath;
+
+	#[test]
+	fn test_smoke() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+
+		let commit =
+			write_commit_file(&repo, "test_1.txt", "test", "commit1");
+		write_commit_file(&repo, "test_2.txt", "test", "commit2");
+
+		checkout_commit(repo_path, commit).unwrap();
+
+		assert!(repo.head_detached().unwrap());
+		assert_eq!(
+			repo.head().unwrap().target().unwrap(),
+			commit.get_oid()
+		);
+	}
+}
+
+#[cfg(test)]
 mod test_delete_branch {
 	use super::*;
 	use crate::sync::tests::repo_init;
@@ -810,7 +908,8 @@ mod test_delete_branch {
 	fn test_delete_branch() {
 		let (_td, repo) = repo_init().unwrap();
 		let root = repo.path().parent().unwrap();
-		let repo_path = root.as_os_str().to_str().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
 
 		create_branch(repo_path, "branch1").unwrap();
 		create_branch(repo_path, "branch2").unwrap();
@@ -850,7 +949,7 @@ mod test_delete_branch {
 #[cfg(test)]
 mod test_remote_branches {
 	use super::*;
-	use crate::sync::remotes::push::push;
+	use crate::sync::remotes::push::push_branch;
 	use crate::sync::tests::{
 		repo_clone, repo_init_bare, write_commit_file,
 	};
@@ -879,17 +978,31 @@ mod test_remote_branches {
 
 		write_commit_file(&clone1, "test.txt", "test", "commit1");
 
-		push(
-			clone1_dir, "origin", "master", false, false, None, None,
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"master",
+			false,
+			false,
+			None,
+			None,
 		)
 		.unwrap();
 
-		create_branch(clone1_dir, "foo").unwrap();
+		create_branch(&clone1_dir.into(), "foo").unwrap();
 
 		write_commit_file(&clone1, "test.txt", "test2", "commit2");
 
-		push(clone1_dir, "origin", "foo", false, false, None, None)
-			.unwrap();
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"foo",
+			false,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
 
 		// clone2
 
@@ -899,11 +1012,12 @@ mod test_remote_branches {
 		let clone2_dir = clone2_dir.path().to_str().unwrap();
 
 		let local_branches =
-			get_branches_info(clone2_dir, true).unwrap();
+			get_branches_info(&clone2_dir.into(), true).unwrap();
 
 		assert_eq!(local_branches.len(), 1);
 
-		let branches = get_branches_info(clone2_dir, false).unwrap();
+		let branches =
+			get_branches_info(&clone2_dir.into(), false).unwrap();
 		assert_eq!(dbg!(&branches).len(), 3);
 		assert_eq!(&branches[0].name, "origin/HEAD");
 		assert_eq!(&branches[1].name, "origin/foo");
@@ -921,14 +1035,28 @@ mod test_remote_branches {
 		// clone1
 
 		write_commit_file(&clone1, "test.txt", "test", "commit1");
-		push(
-			clone1_dir, "origin", "master", false, false, None, None,
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"master",
+			false,
+			false,
+			None,
+			None,
 		)
 		.unwrap();
-		create_branch(clone1_dir, "foo").unwrap();
+		create_branch(&clone1_dir.into(), "foo").unwrap();
 		write_commit_file(&clone1, "test.txt", "test2", "commit2");
-		push(clone1_dir, "origin", "foo", false, false, None, None)
-			.unwrap();
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"foo",
+			false,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
 
 		// clone2
 
@@ -938,21 +1066,28 @@ mod test_remote_branches {
 		let clone2_dir = clone2_dir.path().to_str().unwrap();
 
 		let local_branches =
-			get_branches_info(clone2_dir, true).unwrap();
+			get_branches_info(&clone2_dir.into(), true).unwrap();
 
 		assert_eq!(local_branches.len(), 1);
 
-		let branches = get_branches_info(clone2_dir, false).unwrap();
+		let branches =
+			get_branches_info(&clone2_dir.into(), false).unwrap();
 
 		// checkout origin/foo
-		checkout_remote_branch(clone2_dir, &branches[1]).unwrap();
+		checkout_remote_branch(&clone2_dir.into(), &branches[1])
+			.unwrap();
 
 		assert_eq!(
-			get_branches_info(clone2_dir, true).unwrap().len(),
+			get_branches_info(&clone2_dir.into(), true)
+				.unwrap()
+				.len(),
 			2
 		);
 
-		assert_eq!(&get_branch_name(clone2_dir).unwrap(), "foo");
+		assert_eq!(
+			&get_branch_name(&clone2_dir.into()).unwrap(),
+			"foo"
+		);
 	}
 
 	#[test]
@@ -968,14 +1103,20 @@ mod test_remote_branches {
 		let branch_name = "bar/foo";
 
 		write_commit_file(&clone1, "test.txt", "test", "commit1");
-		push(
-			clone1_dir, "origin", "master", false, false, None, None,
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"master",
+			false,
+			false,
+			None,
+			None,
 		)
 		.unwrap();
-		create_branch(clone1_dir, branch_name).unwrap();
+		create_branch(&clone1_dir.into(), branch_name).unwrap();
 		write_commit_file(&clone1, "test.txt", "test2", "commit2");
-		push(
-			clone1_dir,
+		push_branch(
+			&clone1_dir.into(),
 			"origin",
 			branch_name,
 			false,
@@ -991,12 +1132,14 @@ mod test_remote_branches {
 			repo_clone(r1_dir.path().to_str().unwrap()).unwrap();
 		let clone2_dir = clone2_dir.path().to_str().unwrap();
 
-		let branches = get_branches_info(clone2_dir, false).unwrap();
+		let branches =
+			get_branches_info(&clone2_dir.into(), false).unwrap();
 
-		checkout_remote_branch(clone2_dir, &branches[1]).unwrap();
+		checkout_remote_branch(&clone2_dir.into(), &branches[1])
+			.unwrap();
 
 		assert_eq!(
-			&get_branch_name(clone2_dir).unwrap(),
+			&get_branch_name(&clone2_dir.into()).unwrap(),
 			branch_name
 		);
 	}
@@ -1012,17 +1155,31 @@ mod test_remote_branches {
 		// clone1
 
 		write_commit_file(&clone1, "test.txt", "test", "commit1");
-		push(
-			clone1_dir, "origin", "master", false, false, None, None,
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"master",
+			false,
+			false,
+			None,
+			None,
 		)
 		.unwrap();
-		create_branch(clone1_dir, "foo").unwrap();
+		create_branch(&clone1_dir.into(), "foo").unwrap();
 		write_commit_file(&clone1, "test.txt", "test2", "commit2");
-		push(clone1_dir, "origin", "foo", false, false, None, None)
-			.unwrap();
+		push_branch(
+			&clone1_dir.into(),
+			"origin",
+			"foo",
+			false,
+			false,
+			None,
+			None,
+		)
+		.unwrap();
 
 		let branches_1 =
-			get_branches_info(clone1_dir, false).unwrap();
+			get_branches_info(&clone1_dir.into(), false).unwrap();
 
 		assert!(branches_1[0].remote_details().unwrap().has_tracking);
 		assert!(branches_1[1].remote_details().unwrap().has_tracking);
@@ -1035,7 +1192,7 @@ mod test_remote_branches {
 		let clone2_dir = clone2_dir.path().to_str().unwrap();
 
 		let branches_2 =
-			get_branches_info(clone2_dir, false).unwrap();
+			get_branches_info(&clone2_dir.into(), false).unwrap();
 
 		assert!(
 			!branches_2[0].remote_details().unwrap().has_tracking

@@ -3,26 +3,26 @@ use crate::{
 	components::{
 		command_pump, event_pump, visibility_blocking,
 		CommandBlocking, CommandInfo, Component, DrawableComponent,
-		EventState, FileTreeComponent,
+		EventState, StatusTreeComponent,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, Queue},
 	strings,
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
 use asyncgit::{
-	sync::{self, status::StatusType},
-	AsyncGitNotification, AsyncStatus, StatusParams, CWD,
+	sync::{self, status::StatusType, RepoPathRef},
+	AsyncGitNotification, AsyncStatus, StatusParams,
 };
 use crossbeam_channel::Sender;
 use crossterm::event::Event;
-use std::borrow::Cow;
-use tui::{
+use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout},
 	text::{Span, Spans},
 	widgets::{Block, Borders, Paragraph},
 };
+use std::borrow::Cow;
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct StashingOptions {
@@ -31,7 +31,8 @@ pub struct StashingOptions {
 }
 
 pub struct Stashing {
-	index: FileTreeComponent,
+	repo: RepoPathRef,
+	index: StatusTreeComponent,
 	visible: bool,
 	options: StashingOptions,
 	theme: SharedTheme,
@@ -45,13 +46,15 @@ impl Stashing {
 
 	///
 	pub fn new(
+		repo: &RepoPathRef,
 		sender: &Sender<AsyncGitNotification>,
 		queue: &Queue,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 	) -> Self {
 		Self {
-			index: FileTreeComponent::new(
+			repo: repo.clone(),
+			index: StatusTreeComponent::new(
 				&strings::stashing_files_title(&key_config),
 				true,
 				Some(queue.clone()),
@@ -64,7 +67,10 @@ impl Stashing {
 				stash_untracked: true,
 			},
 			theme,
-			git_status: AsyncStatus::new(sender.clone()),
+			git_status: AsyncStatus::new(
+				repo.borrow().clone(),
+				sender.clone(),
+			),
 			queue: queue.clone(),
 			key_config,
 		}
@@ -122,9 +128,9 @@ impl Stashing {
 			Spans::from(vec![
 				bracket_open,
 				if self.options.keep_index {
-					option_on.clone()
+					option_on
 				} else {
-					option_off.clone()
+					option_off
 				},
 				bracket_close,
 				Span::raw(Cow::from(" keep index")),
@@ -134,10 +140,10 @@ impl Stashing {
 }
 
 impl DrawableComponent for Stashing {
-	fn draw<B: tui::backend::Backend>(
+	fn draw<B: ratatui::backend::Backend>(
 		&self,
-		f: &mut tui::Frame<B>,
-		rect: tui::layout::Rect,
+		f: &mut ratatui::Frame<B>,
+		rect: ratatui::layout::Rect,
 	) -> Result<()> {
 		let chunks = Layout::default()
 			.direction(Direction::Horizontal)
@@ -207,7 +213,7 @@ impl Component for Stashing {
 
 	fn event(
 		&mut self,
-		ev: crossterm::event::Event,
+		ev: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.visible {
 			if event_pump(ev, self.components_mut().as_mut_slice())?
@@ -217,22 +223,28 @@ impl Component for Stashing {
 			}
 
 			if let Event::Key(k) = ev {
-				return if k == self.key_config.stashing_save
-					&& !self.index.is_empty()
+				return if key_match(
+					k,
+					self.key_config.keys.stashing_save,
+				) && !self.index.is_empty()
 				{
 					self.queue.push(InternalEvent::PopupStashing(
 						self.options,
 					));
 
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.stashing_toggle_index {
+				} else if key_match(
+					k,
+					self.key_config.keys.stashing_toggle_index,
+				) {
 					self.options.keep_index =
 						!self.options.keep_index;
 					self.update()?;
 					Ok(EventState::Consumed)
-				} else if k
-					== self.key_config.stashing_toggle_untracked
-				{
+				} else if key_match(
+					k,
+					self.key_config.keys.stashing_toggle_untracked,
+				) {
 					self.options.stash_untracked =
 						!self.options.stash_untracked;
 					self.update()?;
@@ -256,11 +268,12 @@ impl Component for Stashing {
 
 	fn show(&mut self) -> Result<()> {
 		let config_untracked_files =
-			sync::untracked_files_config(CWD)?;
+			sync::untracked_files_config(&self.repo.borrow())?;
 
 		self.options.stash_untracked =
 			!config_untracked_files.include_none();
 
+		self.index.show()?;
 		self.visible = true;
 		self.update()?;
 		Ok(())

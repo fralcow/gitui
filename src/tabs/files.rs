@@ -1,9 +1,3 @@
-#![allow(
-	dead_code,
-	clippy::missing_const_for_fn,
-	clippy::unused_self
-)]
-
 use std::path::PathBuf;
 
 use crate::{
@@ -17,20 +11,24 @@ use crate::{
 	AsyncAppNotification, AsyncNotification,
 };
 use anyhow::Result;
-use asyncgit::{sync, CWD};
+use asyncgit::{
+	sync::{self, RepoPathRef},
+	AsyncGitNotification,
+};
 use crossbeam_channel::Sender;
 
 pub struct FilesTab {
+	repo: RepoPathRef,
 	visible: bool,
-	theme: SharedTheme,
-	key_config: SharedKeyConfig,
 	files: RevisionFilesComponent,
 }
 
 impl FilesTab {
 	///
 	pub fn new(
+		repo: RepoPathRef,
 		sender: &Sender<AsyncAppNotification>,
+		sender_git: Sender<AsyncGitNotification>,
 		queue: &Queue,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
@@ -38,20 +36,21 @@ impl FilesTab {
 		Self {
 			visible: false,
 			files: RevisionFilesComponent::new(
+				repo.clone(),
 				queue,
 				sender,
-				theme.clone(),
-				key_config.clone(),
+				sender_git,
+				theme,
+				key_config,
 			),
-			theme,
-			key_config,
+			repo,
 		}
 	}
 
 	///
 	pub fn update(&mut self) -> Result<()> {
 		if self.is_visible() {
-			if let Ok(head) = sync::get_head(CWD) {
+			if let Ok(head) = sync::get_head(&self.repo.borrow()) {
 				self.files.set_commit(head)?;
 			}
 		}
@@ -65,10 +64,15 @@ impl FilesTab {
 	}
 
 	///
-	pub fn update_async(&mut self, ev: AsyncNotification) {
+	pub fn update_async(
+		&mut self,
+		ev: AsyncNotification,
+	) -> Result<()> {
 		if self.is_visible() {
-			self.files.update(ev);
+			self.files.update(ev)?;
 		}
+
+		Ok(())
 	}
 
 	pub fn file_finder_update(&mut self, file: &Option<PathBuf>) {
@@ -77,10 +81,10 @@ impl FilesTab {
 }
 
 impl DrawableComponent for FilesTab {
-	fn draw<B: tui::backend::Backend>(
+	fn draw<B: ratatui::backend::Backend>(
 		&self,
-		f: &mut tui::Frame<B>,
-		rect: tui::layout::Rect,
+		f: &mut ratatui::Frame<B>,
+		rect: ratatui::layout::Rect,
 	) -> Result<()> {
 		if self.is_visible() {
 			self.files.draw(f, rect)?;
@@ -104,7 +108,7 @@ impl Component for FilesTab {
 
 	fn event(
 		&mut self,
-		ev: crossterm::event::Event,
+		ev: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.visible {
 			return self.files.event(ev);

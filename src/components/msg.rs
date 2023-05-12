@@ -2,16 +2,19 @@ use super::{
 	visibility_blocking, CommandBlocking, CommandInfo, Component,
 	DrawableComponent, EventState,
 };
-use crate::{keys::SharedKeyConfig, strings, ui};
+use crate::{
+	keys::{key_match, SharedKeyConfig},
+	strings, ui,
+};
 use crossterm::event::Event;
-use std::convert::TryFrom;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Alignment, Rect},
 	text::Span,
 	widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 	Frame,
 };
+use std::convert::TryFrom;
 use ui::style::SharedTheme;
 pub struct MsgComponent {
 	title: String,
@@ -89,10 +92,10 @@ impl Component for MsgComponent {
 		visibility_blocking(self)
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			if let Event::Key(e) = ev {
-				if e == self.key_config.enter {
+				if key_match(e, self.key_config.keys.enter) {
 					self.hide();
 				}
 			}
@@ -134,6 +137,15 @@ impl MsgComponent {
 	///
 	pub fn show_error(&mut self, msg: &str) -> Result<()> {
 		self.title = strings::msg_title_error(&self.key_config);
+		self.msg = msg.to_string();
+		self.show()?;
+
+		Ok(())
+	}
+
+	///
+	pub fn show_info(&mut self, msg: &str) -> Result<()> {
+		self.title = strings::msg_title_info(&self.key_config);
 		self.msg = msg.to_string();
 		self.show()?;
 

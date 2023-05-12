@@ -12,12 +12,9 @@ use crate::{
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
-use asyncgit::{
-	sync::{self, CommitDetails, CommitId},
-	CWD,
-};
+use asyncgit::sync::{self, CommitDetails, CommitId, RepoPathRef};
 use crossterm::event::Event;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Constraint, Direction, Layout, Rect},
 	text::{Span, Spans, Text},
@@ -25,6 +22,7 @@ use tui::{
 };
 
 pub struct CompareDetailsComponent {
+	repo: RepoPathRef,
 	data: Option<(CommitDetails, CommitDetails)>,
 	theme: SharedTheme,
 	focused: bool,
@@ -32,18 +30,27 @@ pub struct CompareDetailsComponent {
 
 impl CompareDetailsComponent {
 	///
-	pub const fn new(theme: SharedTheme, focused: bool) -> Self {
+	pub const fn new(
+		repo: RepoPathRef,
+		theme: SharedTheme,
+		focused: bool,
+	) -> Self {
 		Self {
 			data: None,
 			theme,
 			focused,
+			repo,
 		}
 	}
 
 	pub fn set_commits(&mut self, ids: Option<(CommitId, CommitId)>) {
 		self.data = ids.and_then(|ids| {
-			let c1 = sync::get_commit_details(CWD, ids.0).ok();
-			let c2 = sync::get_commit_details(CWD, ids.1).ok();
+			let c1 =
+				sync::get_commit_details(&self.repo.borrow(), ids.0)
+					.ok();
+			let c2 =
+				sync::get_commit_details(&self.repo.borrow(), ids.1)
+					.ok();
 
 			c1.and_then(|c1| {
 				c2.map(|c2| {
@@ -154,7 +161,7 @@ impl Component for CompareDetailsComponent {
 		CommandBlocking::PassingOn
 	}
 
-	fn event(&mut self, _event: Event) -> Result<EventState> {
+	fn event(&mut self, _event: &Event) -> Result<EventState> {
 		Ok(EventState::NotConsumed)
 	}
 

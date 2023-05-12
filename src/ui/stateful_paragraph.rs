@@ -1,12 +1,12 @@
 use easy_cast::Cast;
-use std::iter;
-use tui::{
+use ratatui::{
 	buffer::Buffer,
 	layout::{Alignment, Rect},
 	style::Style,
 	text::{StyledGrapheme, Text},
 	widgets::{Block, StatefulWidget, Widget, Wrap},
 };
+use std::iter;
 use unicode_width::UnicodeWidthStr;
 
 use super::reflow::{LineComposer, LineTruncator, WordWrapper};
@@ -121,14 +121,11 @@ impl<'a> StatefulWidget for StatefulParagraph<'a> {
 		state: &mut Self::State,
 	) {
 		buf.set_style(area, self.style);
-		let text_area = match self.block.take() {
-			Some(b) => {
-				let inner_area = b.inner(area);
-				b.render(area, buf);
-				inner_area
-			}
-			None => area,
-		};
+		let text_area = self.block.take().map_or(area, |b| {
+			let inner_area = b.inner(area);
+			b.render(area, buf);
+			inner_area
+		});
 
 		if text_area.height < 1 {
 			return;

@@ -6,32 +6,32 @@ use crate::{
 		CommandBlocking, CommandInfo, Component, DrawableComponent,
 		EventState, ScrollType,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	strings::{self, order},
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
-use asyncgit::{
-	sync::{self, CommitDetails, CommitId, CommitMessage},
-	CWD,
+use asyncgit::sync::{
+	self, CommitDetails, CommitId, CommitMessage, RepoPathRef, Tag,
 };
 use crossterm::event::Event;
-use std::clone::Clone;
-use std::{borrow::Cow, cell::Cell};
-use sync::CommitTags;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Constraint, Direction, Layout, Rect},
 	style::{Modifier, Style},
 	text::{Span, Spans, Text},
 	Frame,
 };
+use std::clone::Clone;
+use std::{borrow::Cow, cell::Cell};
+use sync::CommitTags;
 
 use super::style::Detail;
 
 pub struct DetailsComponent {
+	repo: RepoPathRef,
 	data: Option<CommitDetails>,
-	tags: Vec<String>,
+	tags: Vec<Tag>,
 	theme: SharedTheme,
 	focused: bool,
 	current_width: Cell<u16>,
@@ -46,11 +46,13 @@ type WrappedCommitMessage<'a> =
 impl DetailsComponent {
 	///
 	pub const fn new(
+		repo: RepoPathRef,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 		focused: bool,
 	) -> Self {
 		Self {
+			repo,
 			data: None,
 			tags: Vec::new(),
 			theme,
@@ -69,8 +71,9 @@ impl DetailsComponent {
 	) {
 		self.tags.clear();
 
-		self.data =
-			id.and_then(|id| sync::get_commit_details(CWD, id).ok());
+		self.data = id.and_then(|id| {
+			sync::get_commit_details(&self.repo.borrow(), id).ok()
+		});
 
 		self.scroll.reset();
 
@@ -221,7 +224,7 @@ impl DetailsComponent {
 					itertools::Itertools::intersperse(
 						self.tags.iter().map(|tag| {
 							Span::styled(
-								Cow::from(tag),
+								Cow::from(&tag.name),
 								self.theme.text(true, false),
 							)
 						}),
@@ -354,24 +357,31 @@ impl Component for DetailsComponent {
 		CommandBlocking::PassingOn
 	}
 
-	fn event(&mut self, event: Event) -> Result<EventState> {
+	fn event(&mut self, event: &Event) -> Result<EventState> {
 		if self.focused {
 			if let Event::Key(e) = event {
-				return Ok(if e == self.key_config.move_up {
-					self.move_scroll_top(ScrollType::Up).into()
-				} else if e == self.key_config.move_down {
-					self.move_scroll_top(ScrollType::Down).into()
-				} else if e == self.key_config.home
-					|| e == self.key_config.shift_up
-				{
-					self.move_scroll_top(ScrollType::Home).into()
-				} else if e == self.key_config.end
-					|| e == self.key_config.shift_down
-				{
-					self.move_scroll_top(ScrollType::End).into()
-				} else {
-					EventState::NotConsumed
-				});
+				return Ok(
+					if key_match(e, self.key_config.keys.move_up) {
+						self.move_scroll_top(ScrollType::Up).into()
+					} else if key_match(
+						e,
+						self.key_config.keys.move_down,
+					) {
+						self.move_scroll_top(ScrollType::Down).into()
+					} else if key_match(e, self.key_config.keys.home)
+						|| key_match(e, self.key_config.keys.shift_up)
+					{
+						self.move_scroll_top(ScrollType::Home).into()
+					} else if key_match(e, self.key_config.keys.end)
+						|| key_match(
+							e,
+							self.key_config.keys.shift_down,
+						) {
+						self.move_scroll_top(ScrollType::End).into()
+					} else {
+						EventState::NotConsumed
+					},
+				);
 			}
 		}
 

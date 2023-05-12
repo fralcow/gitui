@@ -21,15 +21,19 @@
 #![allow(clippy::missing_errors_doc)]
 //TODO: get this in someday since expect still leads us to crashes sometimes
 // #![deny(clippy::expect_used)]
+//TODO: consider cleaning some up and allow specific places
+#![allow(clippy::significant_drop_tightening)]
 
 pub mod asyncjob;
 mod blame;
+mod branches;
 pub mod cached;
 mod commit_files;
 mod diff;
 mod error;
-mod fetch;
+mod fetch_job;
 mod progress;
+mod pull;
 mod push;
 mod push_tags;
 pub mod remote_progress;
@@ -38,14 +42,17 @@ mod revlog;
 mod status;
 pub mod sync;
 mod tags;
+mod treefiles;
 
 pub use crate::{
 	blame::{AsyncBlame, BlameParams},
+	branches::AsyncBranchesJob,
 	commit_files::{AsyncCommitFiles, CommitFilesParams},
 	diff::{AsyncDiff, DiffParams, DiffType},
 	error::{Error, Result},
-	fetch::{AsyncFetch, FetchRequest},
+	fetch_job::AsyncFetchJob,
 	progress::ProgressPercent,
+	pull::{AsyncPull, FetchRequest},
 	push::{AsyncPush, PushRequest},
 	push_tags::{AsyncPushTags, PushTagsRequest},
 	remote_progress::{RemoteProgress, RemoteProgressState},
@@ -53,9 +60,11 @@ pub use crate::{
 	status::{AsyncStatus, StatusParams},
 	sync::{
 		diff::{DiffLine, DiffLineType, FileDiff},
+		remotes::push::PushType,
 		status::{StatusItem, StatusItemType},
 	},
 	tags::AsyncTags,
+	treefiles::AsyncTreeFilesJob,
 };
 pub use git2::message_prettify;
 use std::{
@@ -64,7 +73,7 @@ use std::{
 };
 
 /// this type is used to communicate events back through the channel
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AsyncGitNotification {
 	/// this indicates that no new state was fetched but that a async process finished
 	FinishUnchanged,
@@ -75,6 +84,8 @@ pub enum AsyncGitNotification {
 	///
 	Log,
 	///
+	FileLog,
+	///
 	CommitFiles,
 	///
 	Tags,
@@ -83,15 +94,18 @@ pub enum AsyncGitNotification {
 	///
 	PushTags,
 	///
-	Fetch,
+	Pull,
 	///
 	Blame,
 	///
 	RemoteTags,
+	///
+	Fetch,
+	///
+	Branches,
+	///
+	TreeFiles,
 }
-
-/// current working directory `./`
-pub static CWD: &str = "./";
 
 /// helper function to calculate the hash of an arbitrary type that implements the `Hash` trait
 pub fn hash<T: Hash + ?Sized>(v: &T) -> u64 {
@@ -101,10 +115,16 @@ pub fn hash<T: Hash + ?Sized>(v: &T) -> u64 {
 }
 
 ///
+#[cfg(feature = "trace-libgit")]
 pub fn register_tracing_logging() -> bool {
+	fn git_trace(level: git2::TraceLevel, msg: &str) {
+		log::info!("[{:?}]: {}", level, msg);
+	}
 	git2::trace_set(git2::TraceLevel::Trace, git_trace)
 }
 
-fn git_trace(level: git2::TraceLevel, msg: &str) {
-	log::info!("[{:?}]: {}", level, msg);
+///
+#[cfg(not(feature = "trace-libgit"))]
+pub fn register_tracing_logging() -> bool {
+	true
 }

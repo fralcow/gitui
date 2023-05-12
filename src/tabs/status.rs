@@ -4,30 +4,34 @@ use crate::{
 		command_pump, event_pump, visibility_blocking,
 		ChangesComponent, CommandBlocking, CommandInfo, Component,
 		DiffComponent, DrawableComponent, EventState,
-		FileTreeItemKind, SharedOptions,
+		FileTreeItemKind,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
+	options::SharedOptions,
 	queue::{Action, InternalEvent, NeedsUpdate, Queue, ResetItem},
 	strings, try_or_popup,
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
 use asyncgit::{
+	asyncjob::AsyncSingleJob,
 	cached,
-	sync::{self, status::StatusType, RepoState},
+	sync::{
+		self, status::StatusType, RepoPath, RepoPathRef, RepoState,
+	},
 	sync::{BranchCompare, CommitId},
-	AsyncDiff, AsyncGitNotification, AsyncStatus, DiffParams,
-	DiffType, StatusParams, CWD,
+	AsyncBranchesJob, AsyncDiff, AsyncGitNotification, AsyncStatus,
+	DiffParams, DiffType, PushType, StatusItem, StatusParams,
 };
 use crossbeam_channel::Sender;
 use crossterm::event::Event;
 use itertools::Itertools;
-use std::convert::Into;
-use tui::{
+use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout},
 	style::{Color, Style},
 	widgets::{Block, BorderType, Borders, Paragraph},
 };
+use std::convert::Into;
 
 /// what part of the screen is focused
 #[derive(PartialEq)]
@@ -56,6 +60,7 @@ enum DiffTarget {
 }
 
 pub struct Status {
+	repo: RepoPathRef,
 	visible: bool,
 	focus: Focus,
 	diff_target: DiffTarget,
@@ -63,10 +68,13 @@ pub struct Status {
 	index_wd: ChangesComponent,
 	diff: DiffComponent,
 	git_diff: AsyncDiff,
+	has_remotes: bool,
+	git_state: RepoState,
 	git_status_workdir: AsyncStatus,
 	git_status_stage: AsyncStatus,
 	git_branch_state: Option<BranchCompare>,
 	git_branch_name: cached::BranchName,
+	git_branches: AsyncSingleJob<AsyncBranchesJob>,
 	queue: Queue,
 	git_action_executed: bool,
 	options: SharedOptions,
@@ -74,12 +82,12 @@ pub struct Status {
 }
 
 impl DrawableComponent for Status {
-	fn draw<B: tui::backend::Backend>(
+	fn draw<B: ratatui::backend::Backend>(
 		&self,
-		f: &mut tui::Frame<B>,
-		rect: tui::layout::Rect,
+		f: &mut ratatui::Frame<B>,
+		rect: ratatui::layout::Rect,
 	) -> Result<()> {
-		let repo_unclean = Self::repo_state_unclean();
+		let repo_unclean = self.repo_state_unclean();
 		let rects = if repo_unclean {
 			Layout::default()
 				.direction(Direction::Vertical)
@@ -89,7 +97,7 @@ impl DrawableComponent for Status {
 				)
 				.split(rect)
 		} else {
-			vec![rect]
+			std::rc::Rc::new([rect])
 		};
 
 		let chunks = Layout::default()
@@ -97,8 +105,8 @@ impl DrawableComponent for Status {
 			.constraints(
 				if self.focus == Focus::Diff {
 					[
-						Constraint::Percentage(30),
-						Constraint::Percentage(70),
+						Constraint::Percentage(0),
+						Constraint::Percentage(100),
 					]
 				} else {
 					[
@@ -134,7 +142,7 @@ impl DrawableComponent for Status {
 		self.draw_branch_state(f, &left_chunks);
 
 		if repo_unclean {
-			Self::draw_repo_state(f, rects[1]);
+			self.draw_repo_state(f, rects[1]);
 		}
 
 		Ok(())
@@ -146,54 +154,71 @@ impl Status {
 
 	///
 	pub fn new(
+		repo: RepoPathRef,
 		queue: &Queue,
 		sender: &Sender<AsyncGitNotification>,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 		options: SharedOptions,
 	) -> Self {
+		let repo_clone = repo.borrow().clone();
 		Self {
 			queue: queue.clone(),
 			visible: true,
+			has_remotes: false,
+			git_state: RepoState::Clean,
 			focus: Focus::WorkDir,
 			diff_target: DiffTarget::WorkingDir,
 			index_wd: ChangesComponent::new(
+				repo.clone(),
 				&strings::title_status(&key_config),
 				true,
 				true,
 				queue.clone(),
 				theme.clone(),
 				key_config.clone(),
+				options.clone(),
 			),
 			index: ChangesComponent::new(
+				repo.clone(),
 				&strings::title_index(&key_config),
 				false,
 				false,
 				queue.clone(),
 				theme.clone(),
 				key_config.clone(),
+				options.clone(),
 			),
 			diff: DiffComponent::new(
+				repo.clone(),
 				queue.clone(),
 				theme,
 				key_config.clone(),
 				false,
 			),
-			git_diff: AsyncDiff::new(sender),
-			git_status_workdir: AsyncStatus::new(sender.clone()),
-			git_status_stage: AsyncStatus::new(sender.clone()),
+			git_diff: AsyncDiff::new(repo_clone.clone(), sender),
+			git_status_workdir: AsyncStatus::new(
+				repo_clone.clone(),
+				sender.clone(),
+			),
+			git_status_stage: AsyncStatus::new(
+				repo_clone,
+				sender.clone(),
+			),
+			git_branches: AsyncSingleJob::new(sender.clone()),
 			git_action_executed: false,
 			git_branch_state: None,
-			git_branch_name: cached::BranchName::new(CWD),
+			git_branch_name: cached::BranchName::new(repo.clone()),
 			key_config,
 			options,
+			repo,
 		}
 	}
 
-	fn draw_branch_state<B: tui::backend::Backend>(
+	fn draw_branch_state<B: ratatui::backend::Backend>(
 		&self,
-		f: &mut tui::Frame<B>,
-		chunks: &[tui::layout::Rect],
+		f: &mut ratatui::Frame<B>,
+		chunks: &[ratatui::layout::Rect],
 	) {
 		if let Some(branch_name) = self.git_branch_name.last() {
 			let ahead_behind = self
@@ -207,8 +232,7 @@ impl Status {
 				});
 
 			let w = Paragraph::new(format!(
-				"{}{{{}}}",
-				ahead_behind, branch_name
+				"{ahead_behind}{{{branch_name}}}"
 			))
 			.alignment(Alignment::Right);
 
@@ -230,11 +254,11 @@ impl Status {
 		}
 	}
 
-	fn repo_state_text(state: &RepoState) -> String {
+	fn repo_state_text(repo: &RepoPath, state: &RepoState) -> String {
 		match state {
 			RepoState::Merge => {
 				let ids =
-					sync::mergehead_ids(CWD).unwrap_or_default();
+					sync::mergehead_ids(repo).unwrap_or_default();
 
 				format!(
 					"Commits: {}",
@@ -243,58 +267,68 @@ impl Status {
 						.join(",")
 				)
 			}
-			RepoState::Rebase => {
-				if let Ok(p) = sync::rebase_progress(CWD) {
-					format!(
-						"Step: {}/{} Current Commit: {}",
-						p.current + 1,
-						p.steps,
-						p.current_commit
-							.as_ref()
-							.map(CommitId::get_short_string)
-							.unwrap_or_default(),
-					)
-				} else {
-					String::new()
-				}
+			RepoState::Rebase => sync::rebase_progress(repo)
+				.map_or_else(
+					|_| String::new(),
+					|p| {
+						format!(
+							"Step: {}/{} Current Commit: {}",
+							p.current + 1,
+							p.steps,
+							p.current_commit
+								.as_ref()
+								.map(CommitId::get_short_string)
+								.unwrap_or_default(),
+						)
+					},
+				),
+			RepoState::Revert => {
+				format!(
+					"Revert {}",
+					sync::revert_head(repo)
+						.ok()
+						.as_ref()
+						.map(CommitId::get_short_string)
+						.unwrap_or_default(),
+				)
 			}
-			_ => format!("{:?}", state),
+			_ => format!("{state:?}"),
 		}
 	}
 
-	fn draw_repo_state<B: tui::backend::Backend>(
-		f: &mut tui::Frame<B>,
-		r: tui::layout::Rect,
+	fn draw_repo_state<B: ratatui::backend::Backend>(
+		&self,
+		f: &mut ratatui::Frame<B>,
+		r: ratatui::layout::Rect,
 	) {
-		if let Ok(state) = sync::repo_state(CWD) {
-			if state != RepoState::Clean {
-				let txt = Self::repo_state_text(&state);
+		if self.git_state != RepoState::Clean {
+			let txt = Self::repo_state_text(
+				&self.repo.borrow(),
+				&self.git_state,
+			);
 
-				let w = Paragraph::new(txt)
-					.block(
-						Block::default()
-							.border_type(BorderType::Plain)
-							.borders(Borders::all())
-							.border_style(
-								Style::default().fg(Color::Yellow),
-							)
-							.title(format!("Pending {:?}", state)),
-					)
-					.style(Style::default().fg(Color::Red))
-					.alignment(Alignment::Left);
+			let w = Paragraph::new(txt)
+				.block(
+					Block::default()
+						.border_type(BorderType::Plain)
+						.borders(Borders::all())
+						.border_style(
+							Style::default().fg(Color::Yellow),
+						)
+						.title(format!(
+							"Pending {:?}",
+							self.git_state
+						)),
+				)
+				.style(Style::default().fg(Color::Red))
+				.alignment(Alignment::Left);
 
-				f.render_widget(w, r);
-			}
+			f.render_widget(w, r);
 		}
 	}
 
-	fn repo_state_unclean() -> bool {
-		if let Ok(state) = sync::repo_state(CWD) {
-			if state != RepoState::Clean {
-				return true;
-			}
-		}
-		false
+	fn repo_state_unclean(&self) -> bool {
+		self.git_state != RepoState::Clean
 	}
 
 	fn can_focus_diff(&self) -> bool {
@@ -365,7 +399,8 @@ impl Status {
 		self.git_branch_name.lookup().map(Some).unwrap_or(None);
 
 		if self.is_visible() {
-			let config = self.options.borrow().status_show_untracked;
+			let config =
+				self.options.borrow().status_show_untracked();
 
 			self.git_diff.refresh()?;
 			self.git_status_workdir.fetch(&StatusParams::new(
@@ -376,6 +411,9 @@ impl Status {
 				StatusType::Stage,
 				config,
 			))?;
+
+			self.git_state = sync::repo_state(&self.repo.borrow())
+				.unwrap_or(RepoState::Clean);
 
 			self.branch_compare();
 		}
@@ -388,6 +426,22 @@ impl Status {
 		self.git_diff.is_pending()
 			|| self.git_status_stage.is_pending()
 			|| self.git_status_workdir.is_pending()
+			|| self.git_branches.is_pending()
+	}
+
+	fn check_remotes(&mut self) {
+		self.has_remotes = false;
+
+		if let Some(result) = self.git_branches.take_last() {
+			if let Some(Ok(branches)) = result.result() {
+				self.has_remotes = !branches.is_empty();
+			}
+		} else {
+			self.git_branches.spawn(AsyncBranchesJob::new(
+				self.repo.borrow().clone(),
+				false,
+			));
+		}
 	}
 
 	///
@@ -398,8 +452,9 @@ impl Status {
 		match ev {
 			AsyncGitNotification::Diff => self.update_diff()?,
 			AsyncGitNotification::Status => self.update_status()?,
+			AsyncGitNotification::Branches => self.check_remotes(),
 			AsyncGitNotification::Push
-			| AsyncGitNotification::Fetch
+			| AsyncGitNotification::Pull
 			| AsyncGitNotification::CommitFiles => {
 				self.branch_compare();
 			}
@@ -407,6 +462,10 @@ impl Status {
 		}
 
 		Ok(())
+	}
+
+	pub fn get_files_changes(&mut self) -> Result<Vec<StatusItem>> {
+		Ok(self.git_status_stage.last()?.items)
 	}
 
 	fn update_status(&mut self) -> Result<()> {
@@ -448,7 +507,7 @@ impl Status {
 			let diff_params = DiffParams {
 				path: path.clone(),
 				diff_type,
-				options: self.options.borrow().diff,
+				options: self.options.borrow().diff_options(),
 			};
 
 			if self.diff.current() == (path.clone(), is_stage) {
@@ -495,10 +554,12 @@ impl Status {
 
 	/// called after confirmation
 	pub fn reset(&mut self, item: &ResetItem) -> bool {
-		if let Err(e) = sync::reset_workdir(CWD, item.path.as_str()) {
+		if let Err(e) = sync::reset_workdir(
+			&self.repo.borrow(),
+			item.path.as_str(),
+		) {
 			self.queue.push(InternalEvent::ShowErrorMsg(format!(
-				"reset failed:\n{}",
-				e
+				"reset failed:\n{e}"
 			)));
 
 			false
@@ -523,10 +584,19 @@ impl Status {
 					));
 				} else {
 					self.queue.push(InternalEvent::Push(
-						branch, force, false,
+						branch,
+						PushType::Branch,
+						force,
+						false,
 					));
 				}
 			}
+		}
+	}
+
+	fn fetch(&self) {
+		if self.can_pull() {
+			self.queue.push(InternalEvent::FetchRemotes);
 		}
 	}
 
@@ -540,15 +610,18 @@ impl Status {
 		try_or_popup!(
 			self,
 			"undo commit failed:",
-			sync::utils::undo_last_commit(CWD)
+			sync::utils::undo_last_commit(&self.repo.borrow())
 		);
 	}
 
 	fn branch_compare(&mut self) {
 		self.git_branch_state =
 			self.git_branch_name.last().and_then(|branch| {
-				sync::branch_compare_upstream(CWD, branch.as_str())
-					.ok()
+				sync::branch_compare_upstream(
+					&self.repo.borrow(),
+					branch.as_str(),
+				)
+				.ok()
 			});
 	}
 
@@ -556,27 +629,38 @@ impl Status {
 		self.git_branch_state
 			.as_ref()
 			.map_or(true, |state| state.ahead > 0)
+			&& self.has_remotes
 	}
 
-	fn can_abort_merge() -> bool {
-		sync::repo_state(CWD).unwrap_or(RepoState::Clean)
-			== RepoState::Merge
+	const fn can_pull(&self) -> bool {
+		self.has_remotes && self.git_branch_state.is_some()
 	}
 
-	fn pending_rebase() -> bool {
-		sync::repo_state(CWD).unwrap_or(RepoState::Clean)
-			== RepoState::Rebase
+	fn can_abort_merge(&self) -> bool {
+		self.git_state == RepoState::Merge
 	}
 
-	pub fn abort_merge(&self) {
-		try_or_popup!(self, "abort merge", sync::abort_merge(CWD));
+	fn pending_rebase(&self) -> bool {
+		self.git_state == RepoState::Rebase
+	}
+
+	fn pending_revert(&self) -> bool {
+		self.git_state == RepoState::Revert
+	}
+
+	pub fn revert_pending_state(&self) {
+		try_or_popup!(
+			self,
+			"revert pending state",
+			sync::abort_pending_state(&self.repo.borrow())
+		);
 	}
 
 	pub fn abort_rebase(&self) {
 		try_or_popup!(
 			self,
 			"abort rebase",
-			sync::abort_pending_rebase(CWD)
+			sync::abort_pending_rebase(&self.repo.borrow())
 		);
 	}
 
@@ -584,7 +668,7 @@ impl Status {
 		try_or_popup!(
 			self,
 			"continue rebase",
-			sync::continue_pending_rebase(CWD)
+			sync::continue_pending_rebase(&self.repo.borrow())
 		);
 	}
 
@@ -596,7 +680,7 @@ impl Status {
 		let focus_on_diff = self.is_focus_on_diff();
 		out.push(
 			CommandInfo::new(
-				strings::commands::diff_focus_left(&self.key_config),
+				strings::commands::close_popup(&self.key_config),
 				true,
 				(self.visible && focus_on_diff) || force_all,
 			)
@@ -635,7 +719,7 @@ impl Status {
 	fn can_commit(&self) -> bool {
 		self.index.focused()
 			&& !self.index.is_empty()
-			&& !Self::pending_rebase()
+			&& !self.pending_rebase()
 	}
 }
 
@@ -683,50 +767,57 @@ impl Component for Status {
 				true,
 				self.can_push() && !focus_on_diff,
 			));
+
+			out.push(CommandInfo::new(
+				strings::commands::status_fetch(&self.key_config),
+				self.can_pull(),
+				!focus_on_diff,
+			));
 			out.push(CommandInfo::new(
 				strings::commands::status_pull(&self.key_config),
-				true,
+				self.can_pull(),
 				!focus_on_diff,
 			));
 
 			out.push(CommandInfo::new(
 				strings::commands::undo_commit(&self.key_config),
 				true,
-				(!Self::pending_rebase() && !focus_on_diff)
+				(!self.pending_rebase() && !focus_on_diff)
 					|| force_all,
 			));
 
 			out.push(CommandInfo::new(
 				strings::commands::abort_merge(&self.key_config),
 				true,
-				Self::can_abort_merge() || force_all,
+				self.can_abort_merge() || force_all,
 			));
 
 			out.push(CommandInfo::new(
 				strings::commands::continue_rebase(&self.key_config),
 				true,
-				Self::pending_rebase() || force_all,
+				self.pending_rebase() || force_all,
 			));
+
 			out.push(CommandInfo::new(
 				strings::commands::abort_rebase(&self.key_config),
 				true,
-				Self::pending_rebase() || force_all,
+				self.pending_rebase() || force_all,
 			));
-		}
 
-		{
 			out.push(CommandInfo::new(
-				strings::commands::edit_item(&self.key_config),
-				if focus_on_diff {
-					true
-				} else {
-					self.can_focus_diff()
-				},
-				self.visible || force_all,
+				strings::commands::abort_revert(&self.key_config),
+				true,
+				self.pending_revert() || force_all,
 			));
 
-			self.commands_nav(out, force_all);
+			out.push(CommandInfo::new(
+				strings::commands::view_submodules(&self.key_config),
+				true,
+				true,
+			));
 		}
+
+		self.commands_nav(out, force_all);
 
 		visibility_blocking(self)
 	}
@@ -734,7 +825,7 @@ impl Component for Status {
 	#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 	fn event(
 		&mut self,
-		ev: crossterm::event::Event,
+		ev: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.visible {
 			if event_pump(ev, self.components_mut().as_mut_slice())?
@@ -745,100 +836,127 @@ impl Component for Status {
 			}
 
 			if let Event::Key(k) = ev {
-				return if k == self.key_config.edit_file
-					&& (self.can_focus_diff()
-						|| self.is_focus_on_diff())
-				{
-					if let Some((path, _)) = self.selected_path() {
-						self.queue.push(
-							InternalEvent::OpenExternalEditor(Some(
-								path,
-							)),
-						);
-					}
-					Ok(EventState::Consumed)
-				} else if k == self.key_config.open_commit
-					&& self.can_commit()
+				return if key_match(
+					k,
+					self.key_config.keys.open_commit,
+				) && self.can_commit()
 				{
 					self.queue.push(InternalEvent::OpenCommit);
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.toggle_workarea
-					&& !self.is_focus_on_diff()
+				} else if key_match(
+					k,
+					self.key_config.keys.toggle_workarea,
+				) && !self.is_focus_on_diff()
 				{
 					self.switch_focus(self.focus.toggled_focus())
 						.map(Into::into)
-				} else if k == self.key_config.focus_right
-					&& self.can_focus_diff()
+				} else if key_match(
+					k,
+					self.key_config.keys.move_right,
+				) && self.can_focus_diff()
 				{
 					self.switch_focus(Focus::Diff).map(Into::into)
-				} else if k == self.key_config.focus_left {
+				} else if key_match(
+					k,
+					self.key_config.keys.exit_popup,
+				) {
 					self.switch_focus(match self.diff_target {
 						DiffTarget::Stage => Focus::Stage,
 						DiffTarget::WorkingDir => Focus::WorkDir,
 					})
 					.map(Into::into)
-				} else if k == self.key_config.move_down
+				} else if key_match(k, self.key_config.keys.move_down)
 					&& self.focus == Focus::WorkDir
 					&& !self.index.is_empty()
 				{
 					self.switch_focus(Focus::Stage).map(Into::into)
-				} else if k == self.key_config.move_up
+				} else if key_match(k, self.key_config.keys.move_up)
 					&& self.focus == Focus::Stage
 					&& !self.index_wd.is_empty()
 				{
 					self.switch_focus(Focus::WorkDir).map(Into::into)
-				} else if k == self.key_config.select_branch
-					&& !self.is_focus_on_diff()
+				} else if key_match(
+					k,
+					self.key_config.keys.select_branch,
+				) && !self.is_focus_on_diff()
 				{
 					self.queue.push(InternalEvent::SelectBranch);
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.force_push
-					&& !self.is_focus_on_diff()
+				} else if key_match(
+					k,
+					self.key_config.keys.force_push,
+				) && !self.is_focus_on_diff()
 					&& self.can_push()
 				{
 					self.push(true);
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.push
+				} else if key_match(k, self.key_config.keys.push)
 					&& !self.is_focus_on_diff()
 				{
 					self.push(false);
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.pull
+				} else if key_match(k, self.key_config.keys.fetch)
 					&& !self.is_focus_on_diff()
+					&& self.can_pull()
+				{
+					self.fetch();
+					Ok(EventState::Consumed)
+				} else if key_match(k, self.key_config.keys.pull)
+					&& !self.is_focus_on_diff()
+					&& self.can_pull()
 				{
 					self.pull();
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.undo_commit
-					&& !self.is_focus_on_diff()
+				} else if key_match(
+					k,
+					self.key_config.keys.undo_commit,
+				) && !self.is_focus_on_diff()
 				{
 					self.undo_last_commit();
 					self.queue.push(InternalEvent::Update(
 						NeedsUpdate::ALL,
 					));
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.abort_merge
-					&& Self::can_abort_merge()
-				{
-					self.queue.push(InternalEvent::ConfirmAction(
-						Action::AbortMerge,
-					));
+				} else if key_match(
+					k,
+					self.key_config.keys.abort_merge,
+				) {
+					if self.can_abort_merge() {
+						self.queue.push(
+							InternalEvent::ConfirmAction(
+								Action::AbortMerge,
+							),
+						);
+					} else if self.pending_rebase() {
+						self.queue.push(
+							InternalEvent::ConfirmAction(
+								Action::AbortRebase,
+							),
+						);
+					} else if self.pending_revert() {
+						self.queue.push(
+							InternalEvent::ConfirmAction(
+								Action::AbortRevert,
+							),
+						);
+					}
 
 					Ok(EventState::Consumed)
-				} else if k == self.key_config.abort_merge
-					&& Self::pending_rebase()
-				{
-					self.queue.push(InternalEvent::ConfirmAction(
-						Action::AbortRebase,
-					));
-
-					Ok(EventState::Consumed)
-				} else if k == self.key_config.rebase_branch
-					&& Self::pending_rebase()
+				} else if key_match(
+					k,
+					self.key_config.keys.rebase_branch,
+				) && self.pending_rebase()
 				{
 					self.continue_rebase();
 					self.queue.push(InternalEvent::Update(
 						NeedsUpdate::ALL,
 					));
+					Ok(EventState::Consumed)
+				} else if key_match(
+					k,
+					self.key_config.keys.view_submodules,
+				) {
+					self.queue.push(InternalEvent::ViewSubmodules);
 					Ok(EventState::Consumed)
 				} else {
 					Ok(EventState::NotConsumed)
@@ -855,10 +973,17 @@ impl Component for Status {
 
 	fn hide(&mut self) {
 		self.visible = false;
+
+		self.index.hide();
+		self.index_wd.hide();
 	}
 
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
+		self.index.show()?;
+		self.index_wd.show()?;
+
+		self.check_remotes();
 		self.update()?;
 
 		Ok(())

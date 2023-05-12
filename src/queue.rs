@@ -1,6 +1,13 @@
-use crate::{components::AppOption, tabs::StashingOptions};
-use asyncgit::sync::{
-	diff::DiffLinePosition, CommitId, CommitTags, TreeFile,
+use crate::{
+	components::{
+		AppOption, BlameFileOpen, FileRevOpen, FileTreeOpen,
+		InspectCommitOpen,
+	},
+	tabs::StashingOptions,
+};
+use asyncgit::{
+	sync::{diff::DiffLinePosition, CommitId, TreeFile},
+	PushType,
 };
 use bitflags::bitflags;
 use std::{
@@ -41,10 +48,26 @@ pub enum Action {
 	DeleteLocalBranch(String),
 	DeleteRemoteBranch(String),
 	DeleteTag(String),
+	DeleteRemoteTag(String, String),
 	ForcePush(String, bool),
 	PullMerge { incoming: usize, rebase: bool },
 	AbortMerge,
 	AbortRebase,
+	AbortRevert,
+}
+
+#[derive(Debug)]
+pub enum StackablePopupOpen {
+	///
+	BlameFile(BlameFileOpen),
+	///
+	FileRevlog(FileRevOpen),
+	///
+	FileTree(FileTreeOpen),
+	///
+	InspectCommit(InspectCommitOpen),
+	///
+	CompareCommits(InspectCommitOpen),
 }
 
 ///
@@ -56,6 +79,8 @@ pub enum InternalEvent {
 	///
 	ShowErrorMsg(String),
 	///
+	ShowInfoMsg(String),
+	///
 	Update(NeedsUpdate),
 	///
 	StatusLastFileMoved,
@@ -64,19 +89,13 @@ pub enum InternalEvent {
 	///
 	PopupStashing(StashingOptions),
 	///
-	TabSwitch,
-	///
-	InspectCommit(CommitId, Option<CommitTags>),
-	///
-	CompareCommits(CommitId, Option<CommitId>),
+	TabSwitchStatus,
 	///
 	SelectCommitInRevlog(CommitId),
 	///
 	TagCommit(CommitId),
 	///
 	Tags,
-	///
-	BlameFile(String),
 	///
 	CreateBranch,
 	///
@@ -86,19 +105,37 @@ pub enum InternalEvent {
 	///
 	OpenExternalEditor(Option<String>),
 	///
-	Push(String, bool, bool),
+	Push(String, PushType, bool, bool),
 	///
 	Pull(String),
 	///
 	PushTags,
 	///
-	OpenFileTree(CommitId),
-	///
 	OptionSwitched(AppOption),
 	///
 	OpenFileFinder(Vec<TreeFile>),
 	///
+	OpenBranchFinder(Vec<String>),
+	///
 	FileFinderChanged(Option<PathBuf>),
+	///
+	BranchFinderChanged(Option<usize>),
+	///
+	FetchRemotes,
+	///
+	OpenPopup(StackablePopupOpen),
+	///
+	PopupStackPop,
+	///
+	PopupStackPush(StackablePopupOpen),
+	///
+	ViewSubmodules,
+	///
+	OpenRepo { path: PathBuf },
+	///
+	OpenResetPopup(CommitId),
+	///
+	RewordCommit(CommitId),
 }
 
 /// single threaded simple queue for components to communicate with each other

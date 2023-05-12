@@ -4,20 +4,18 @@ use super::{
 	EventState,
 };
 use crate::{
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, NeedsUpdate, Queue},
 	strings,
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
-use asyncgit::{
-	sync::{self},
-	CWD,
-};
+use asyncgit::sync::{self, RepoPathRef};
 use crossterm::event::Event;
-use tui::{backend::Backend, layout::Rect, Frame};
+use ratatui::{backend::Backend, layout::Rect, Frame};
 
 pub struct RenameBranchComponent {
+	repo: RepoPathRef,
 	input: TextInputComponent,
 	branch_ref: Option<String>,
 	queue: Queue,
@@ -57,14 +55,14 @@ impl Component for RenameBranchComponent {
 		visibility_blocking(self)
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.is_visible() {
 			if self.input.event(ev)?.is_consumed() {
 				return Ok(EventState::Consumed);
 			}
 
 			if let Event::Key(e) = ev {
-				if e == self.key_config.enter {
+				if key_match(e, self.key_config.keys.enter) {
 					self.rename_branch();
 				}
 
@@ -92,11 +90,13 @@ impl Component for RenameBranchComponent {
 impl RenameBranchComponent {
 	///
 	pub fn new(
+		repo: RepoPathRef,
 		queue: Queue,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 	) -> Self {
 		Self {
+			repo,
 			queue,
 			input: TextInputComponent::new(
 				theme,
@@ -127,8 +127,11 @@ impl RenameBranchComponent {
 	///
 	pub fn rename_branch(&mut self) {
 		if let Some(br) = &self.branch_ref {
-			let res =
-				sync::rename_branch(CWD, br, self.input.get_text());
+			let res = sync::rename_branch(
+				&self.repo.borrow(),
+				br,
+				self.input.get_text(),
+			);
 
 			match res {
 				Ok(_) => {
@@ -141,7 +144,7 @@ impl RenameBranchComponent {
 				Err(e) => {
 					log::error!("create branch: {}", e,);
 					self.queue.push(InternalEvent::ShowErrorMsg(
-						format!("rename branch error:\n{}", e,),
+						format!("rename branch error:\n{e}",),
 					));
 				}
 			}

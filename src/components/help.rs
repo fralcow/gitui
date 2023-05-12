@@ -2,13 +2,16 @@ use super::{
 	visibility_blocking, CommandBlocking, CommandInfo, Component,
 	DrawableComponent, EventState,
 };
-use crate::{keys::SharedKeyConfig, strings, ui, version::Version};
+use crate::{
+	keys::{key_match, SharedKeyConfig},
+	strings, ui,
+	version::Version,
+};
 use anyhow::Result;
 use asyncgit::hash;
 use crossterm::event::Event;
 use itertools::Itertools;
-use std::{borrow::Cow, cmp, convert::TryFrom};
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Alignment, Constraint, Direction, Layout, Rect},
 	style::{Modifier, Style},
@@ -16,6 +19,7 @@ use tui::{
 	widgets::{Block, BorderType, Borders, Clear, Paragraph},
 	Frame,
 };
+use std::{borrow::Cow, cmp, convert::TryFrom};
 use ui::style::SharedTheme;
 
 ///
@@ -121,14 +125,15 @@ impl Component for HelpComponent {
 		visibility_blocking(self)
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			if let Event::Key(e) = ev {
-				if e == self.key_config.exit_popup {
+				if key_match(e, self.key_config.keys.exit_popup) {
 					self.hide();
-				} else if e == self.key_config.move_down {
+				} else if key_match(e, self.key_config.keys.move_down)
+				{
 					self.move_selection(true);
-				} else if e == self.key_config.move_up {
+				} else if key_match(e, self.key_config.keys.move_up) {
 					self.move_selection(false);
 				} else {
 				}
@@ -136,7 +141,7 @@ impl Component for HelpComponent {
 
 			Ok(EventState::Consumed)
 		} else if let Event::Key(k) = ev {
-			if k == self.key_config.open_help {
+			if key_match(k, self.key_config.keys.open_help) {
 				self.show()?;
 				Ok(EventState::Consumed)
 			} else {

@@ -1,10 +1,12 @@
-use super::utils;
 use crate::{
 	error::{Error, Result},
 	progress::ProgressPercent,
 	sync::{
-		branch::branch_set_upstream, cred::BasicAuthCredential,
-		remotes::Callbacks, CommitId,
+		branch::branch_set_upstream,
+		cred::BasicAuthCredential,
+		remotes::{proxy_auto, Callbacks},
+		repository::repo,
+		CommitId, RepoPath,
 	},
 };
 use crossbeam_channel::Sender;
@@ -20,7 +22,7 @@ pub trait AsyncProgress: Clone + Send + Sync {
 }
 
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressNotification {
 	///
 	UpdateTips {
@@ -89,9 +91,24 @@ impl AsyncProgress for ProgressNotification {
 	}
 }
 
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) fn push(
-	repo_path: &str,
+///
+#[derive(Copy, Clone, Debug)]
+pub enum PushType {
+	///
+	Branch,
+	///
+	Tag,
+}
+
+impl Default for PushType {
+	fn default() -> Self {
+		Self::Branch
+	}
+}
+
+#[cfg(test)]
+pub fn push_branch(
+	repo_path: &RepoPath,
 	remote: &str,
 	branch: &str,
 	force: bool,
@@ -99,12 +116,37 @@ pub(crate) fn push(
 	basic_credential: Option<BasicAuthCredential>,
 	progress_sender: Option<Sender<ProgressNotification>>,
 ) -> Result<()> {
+	push_raw(
+		repo_path,
+		remote,
+		branch,
+		PushType::Branch,
+		force,
+		delete,
+		basic_credential,
+		progress_sender,
+	)
+}
+
+//TODO: clenaup
+#[allow(clippy::too_many_arguments)]
+pub fn push_raw(
+	repo_path: &RepoPath,
+	remote: &str,
+	branch: &str,
+	ref_type: PushType,
+	force: bool,
+	delete: bool,
+	basic_credential: Option<BasicAuthCredential>,
+	progress_sender: Option<Sender<ProgressNotification>>,
+) -> Result<()> {
 	scope_time!("push");
 
-	let repo = utils::repo(repo_path)?;
+	let repo = repo(repo_path)?;
 	let mut remote = repo.find_remote(remote)?;
 
 	let mut options = PushOptions::new();
+	options.proxy_options(proxy_auto());
 
 	let callbacks = Callbacks::new(progress_sender, basic_credential);
 	options.remote_callbacks(callbacks.callbacks());
@@ -116,16 +158,20 @@ pub(crate) fn push(
 		(true, false) => "+",
 		(false, false) => "",
 	};
+	let ref_type = match ref_type {
+		PushType::Branch => "heads",
+		PushType::Tag => "tags",
+	};
+
 	let branch_name =
-		format!("{}refs/heads/{}", branch_modifier, branch);
+		format!("{branch_modifier}refs/{ref_type}/{branch}");
 	remote.push(&[branch_name.as_str()], Some(&mut options))?;
 
 	if let Some((reference, msg)) =
 		callbacks.get_stats()?.push_rejected_msg
 	{
 		return Err(Error::Generic(format!(
-			"push to '{}' rejected: {}",
-			reference, msg
+			"push to '{reference}' rejected: {msg}"
 		)));
 	}
 
@@ -178,13 +224,13 @@ mod tests {
 		writeln!(tmp_repo_file, "TempSomething").unwrap();
 
 		sync::commit(
-			tmp_repo_dir.path().to_str().unwrap(),
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"repo_1_commit",
 		)
 		.unwrap();
 
-		push(
-			tmp_repo_dir.path().to_str().unwrap(),
+		push_branch(
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"origin",
 			"master",
 			false,
@@ -201,7 +247,7 @@ mod tests {
 		writeln!(tmp_other_repo_file, "TempElse").unwrap();
 
 		sync::commit(
-			tmp_other_repo_dir.path().to_str().unwrap(),
+			&tmp_other_repo_dir.path().to_str().unwrap().into(),
 			"repo_2_commit",
 		)
 		.unwrap();
@@ -209,8 +255,8 @@ mod tests {
 		// Attempt a normal push,
 		// should fail as branches diverged
 		assert_eq!(
-			push(
-				tmp_other_repo_dir.path().to_str().unwrap(),
+			push_branch(
+				&tmp_other_repo_dir.path().to_str().unwrap().into(),
 				"origin",
 				"master",
 				false,
@@ -225,8 +271,8 @@ mod tests {
 		// Attempt force push,
 		// should work as it forces the push through
 		assert_eq!(
-			push(
-				tmp_other_repo_dir.path().to_str().unwrap(),
+			push_branch(
+				&tmp_other_repo_dir.path().to_str().unwrap().into(),
 				"origin",
 				"master",
 				true,
@@ -269,13 +315,13 @@ mod tests {
 		writeln!(tmp_repo_file, "TempSomething").unwrap();
 
 		sync::stage_add_file(
-			tmp_repo_dir.path().to_str().unwrap(),
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			Path::new("temp_file.txt"),
 		)
 		.unwrap();
 
 		let repo_1_commit = sync::commit(
-			tmp_repo_dir.path().to_str().unwrap(),
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"repo_1_commit",
 		)
 		.unwrap();
@@ -283,7 +329,7 @@ mod tests {
 		//NOTE: make sure the commit actually contains that file
 		assert_eq!(
 			sync::get_commit_files(
-				tmp_repo_dir.path().to_str().unwrap(),
+				&tmp_repo_dir.path().to_str().unwrap().into(),
 				repo_1_commit,
 				None
 			)
@@ -295,8 +341,8 @@ mod tests {
 		let commits = get_commit_ids(&repo, 1);
 		assert!(commits.contains(&repo_1_commit));
 
-		push(
-			tmp_repo_dir.path().to_str().unwrap(),
+		push_branch(
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"origin",
 			"master",
 			false,
@@ -313,13 +359,13 @@ mod tests {
 		writeln!(tmp_other_repo_file, "TempElse").unwrap();
 
 		sync::stage_add_file(
-			tmp_other_repo_dir.path().to_str().unwrap(),
+			&tmp_other_repo_dir.path().to_str().unwrap().into(),
 			Path::new("temp_file.txt"),
 		)
 		.unwrap();
 
 		let repo_2_commit = sync::commit(
-			tmp_other_repo_dir.path().to_str().unwrap(),
+			&tmp_other_repo_dir.path().to_str().unwrap().into(),
 			"repo_2_commit",
 		)
 		.unwrap();
@@ -338,8 +384,8 @@ mod tests {
 		// Attempt a normal push,
 		// should fail as branches diverged
 		assert_eq!(
-			push(
-				tmp_other_repo_dir.path().to_str().unwrap(),
+			push_branch(
+				&tmp_other_repo_dir.path().to_str().unwrap().into(),
 				"origin",
 				"master",
 				false,
@@ -359,8 +405,8 @@ mod tests {
 		// Attempt force push,
 		// should work as it forces the push through
 
-		push(
-			tmp_other_repo_dir.path().to_str().unwrap(),
+		push_branch(
+			&tmp_other_repo_dir.path().to_str().unwrap().into(),
 			"origin",
 			"master",
 			true,
@@ -406,8 +452,8 @@ mod tests {
 		let commits = get_commit_ids(&repo, 1);
 		assert!(commits.contains(&commit_1));
 
-		push(
-			tmp_repo_dir.path().to_str().unwrap(),
+		push_branch(
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"origin",
 			"master",
 			false,
@@ -419,14 +465,14 @@ mod tests {
 
 		// Create the local branch
 		sync::create_branch(
-			tmp_repo_dir.path().to_str().unwrap(),
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"test_branch",
 		)
 		.unwrap();
 
 		// Push the local branch
-		push(
-			tmp_repo_dir.path().to_str().unwrap(),
+		push_branch(
+			&tmp_repo_dir.path().to_str().unwrap().into(),
 			"origin",
 			"test_branch",
 			false,
@@ -441,18 +487,16 @@ mod tests {
 			upstream_repo
 				.branches(None)
 				.unwrap()
-				.map(|i| i.unwrap())
+				.map(std::result::Result::unwrap)
 				.map(|(i, _)| i.name().unwrap().unwrap().to_string())
-				.filter(|i| i == "test_branch")
-				.next()
-				.is_some(),
+				.any(|i| &i == "test_branch"),
 			true
 		);
 
 		// Delete the remote branch
 		assert_eq!(
-			push(
-				tmp_repo_dir.path().to_str().unwrap(),
+			push_branch(
+				&tmp_repo_dir.path().to_str().unwrap().into(),
 				"origin",
 				"test_branch",
 				false,
@@ -469,11 +513,9 @@ mod tests {
 			upstream_repo
 				.branches(None)
 				.unwrap()
-				.map(|i| i.unwrap())
+				.map(std::result::Result::unwrap)
 				.map(|(i, _)| i.name().unwrap().unwrap().to_string())
-				.filter(|i| i == "test_branch")
-				.next()
-				.is_some(),
+				.any(|i| &i == "test_branch"),
 			false
 		);
 	}

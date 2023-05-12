@@ -3,27 +3,27 @@ use super::{
 		filetree::{FileTreeItem, FileTreeItemKind},
 		statustree::{MoveSelection, StatusTree},
 	},
-	CommandBlocking, DrawableComponent,
+	BlameFileOpen, CommandBlocking, DrawableComponent, FileRevOpen,
 };
 use crate::{
 	components::{CommandInfo, Component, EventState},
-	keys::SharedKeyConfig,
-	queue::{InternalEvent, NeedsUpdate, Queue},
+	keys::{key_match, SharedKeyConfig},
+	queue::{InternalEvent, NeedsUpdate, Queue, StackablePopupOpen},
 	strings::{self, order},
 	ui,
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
-use asyncgit::{hash, StatusItem, StatusItemType};
+use asyncgit::{hash, sync::CommitId, StatusItem, StatusItemType};
 use crossterm::event::Event;
+use ratatui::{backend::Backend, layout::Rect, text::Span, Frame};
 use std::{borrow::Cow, cell::Cell, convert::From, path::Path};
-use tui::{backend::Backend, layout::Rect, text::Span, Frame};
 
-//TODO: rename so that its clear this only works for Statuses
 //TODO: use new `filetreelist` crate
 
 ///
-pub struct FileTreeComponent {
+#[allow(clippy::struct_excessive_bools)]
+pub struct StatusTreeComponent {
 	title: String,
 	tree: StatusTree,
 	pending: bool,
@@ -34,9 +34,11 @@ pub struct FileTreeComponent {
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 	scroll_top: Cell<usize>,
+	visible: bool,
+	revision: Option<CommitId>,
 }
 
-impl FileTreeComponent {
+impl StatusTreeComponent {
 	///
 	pub fn new(
 		title: &str,
@@ -56,12 +58,19 @@ impl FileTreeComponent {
 			key_config,
 			scroll_top: Cell::new(0),
 			pending: true,
+			visible: false,
+			revision: None,
 		}
+	}
+
+	pub fn set_commit(&mut self, revision: Option<CommitId>) {
+		self.revision = revision;
 	}
 
 	///
 	pub fn update(&mut self, list: &[StatusItem]) -> Result<()> {
 		self.pending = false;
+
 		let new_hash = hash(list);
 		if self.current_hash != new_hash {
 			self.tree.update(list)?;
@@ -157,9 +166,9 @@ impl FileTreeComponent {
 		theme: &'b SharedTheme,
 	) -> Option<Span<'b>> {
 		let indent_str = if indent == 0 {
-			String::from("")
+			String::new()
 		} else {
-			format!("{:w$}", " ", w = (indent as usize) * 2)
+			format!("{:w$}", " ", w = indent * 2)
 		};
 
 		if !visible {
@@ -184,7 +193,7 @@ impl FileTreeComponent {
 						w = width as usize
 					)
 				} else {
-					format!("{} {}{}", status_char, indent_str, file)
+					format!("{status_char} {indent_str}{file}")
 				};
 
 				Some(Span::styled(
@@ -206,10 +215,7 @@ impl FileTreeComponent {
 						w = width as usize
 					)
 				} else {
-					format!(
-						"  {}{}{}",
-						indent_str, collapse_char, string,
-					)
+					format!("  {indent_str}{collapse_char}{string}",)
 				};
 
 				Some(Span::styled(
@@ -220,7 +226,7 @@ impl FileTreeComponent {
 		}
 	}
 
-	/// Returns a Vec<TextDrawInfo> which is used to draw the `FileTreeComponent` correctly,
+	/// Returns a `Vec<TextDrawInfo>` which is used to draw the `FileTreeComponent` correctly,
 	/// allowing folders to be folded up if they are alone in their directory
 	fn build_vec_text_draw_info_for_drawing(
 		&self,
@@ -262,8 +268,6 @@ impl FileTreeComponent {
 				should_skip_over += 1;
 
 				// don't fold files up
-				//TODO: remove once fixed (https://github.com/rust-lang/rust-clippy/issues/7383)
-				#[allow(clippy::if_same_then_else)]
 				if let FileTreeItemKind::File(_) =
 					&tree_items[idx_temp].kind
 				{
@@ -298,6 +302,21 @@ impl FileTreeComponent {
 			selection_offset_visible,
 		)
 	}
+
+	// Copy the real path of selected file to clickboard
+	fn copy_file_path(&self) {
+		if let Some(item) = self.selection() {
+			if crate::clipboard::copy_string(&item.info.full_path)
+				.is_err()
+			{
+				if let Some(queue) = &self.queue {
+					queue.push(InternalEvent::ShowErrorMsg(
+						strings::POPUP_FAIL_COPY.to_string(),
+					));
+				}
+			}
+		}
+	}
 }
 
 /// Used for drawing the `FileTreeComponent`
@@ -308,12 +327,16 @@ struct TextDrawInfo<'a> {
 	item_kind: &'a FileTreeItemKind,
 }
 
-impl DrawableComponent for FileTreeComponent {
+impl DrawableComponent for StatusTreeComponent {
 	fn draw<B: Backend>(
 		&self,
 		f: &mut Frame<B>,
 		r: Rect,
 	) -> Result<()> {
+		if !self.is_visible() {
+			return Ok(());
+		}
+
 		if self.pending {
 			let items = vec![Span::styled(
 				Cow::from(strings::loading_text(&self.key_config)),
@@ -363,6 +386,7 @@ impl DrawableComponent for FileTreeComponent {
 					)
 				})
 				.skip(self.scroll_top.get());
+
 			ui::draw_list(
 				f,
 				r,
@@ -377,7 +401,7 @@ impl DrawableComponent for FileTreeComponent {
 	}
 }
 
-impl Component for FileTreeComponent {
+impl Component for StatusTreeComponent {
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -391,6 +415,7 @@ impl Component for FileTreeComponent {
 			)
 			.order(order::NAV),
 		);
+
 		out.push(
 			CommandInfo::new(
 				strings::commands::blame_file(&self.key_config),
@@ -400,44 +425,115 @@ impl Component for FileTreeComponent {
 			.order(order::RARE_ACTION),
 		);
 
+		out.push(
+			CommandInfo::new(
+				strings::commands::open_file_history(
+					&self.key_config,
+				),
+				self.selection_file().is_some(),
+				self.focused || force_all,
+			)
+			.order(order::RARE_ACTION),
+		);
+
+		out.push(
+			CommandInfo::new(
+				strings::commands::edit_item(&self.key_config),
+				self.selection_file().is_some(),
+				self.focused || force_all,
+			)
+			.order(order::RARE_ACTION),
+		);
+
+		out.push(
+			CommandInfo::new(
+				strings::commands::copy_path(&self.key_config),
+				self.selection_file().is_some(),
+				self.focused || force_all,
+			)
+			.order(order::RARE_ACTION),
+		);
+
 		CommandBlocking::PassingOn
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.focused {
 			if let Event::Key(e) = ev {
-				return if e == self.key_config.blame {
-					match (&self.queue, self.selection_file()) {
-						(Some(queue), Some(status_item)) => {
-							queue.push(InternalEvent::BlameFile(
-								status_item.path,
+				return if key_match(e, self.key_config.keys.blame) {
+					if let Some(status_item) = self.selection_file() {
+						self.hide();
+						if let Some(queue) = &self.queue {
+							queue.push(InternalEvent::OpenPopup(
+								StackablePopupOpen::BlameFile(
+									BlameFileOpen {
+										file_path: status_item.path,
+										commit_id: self.revision,
+										selection: None,
+									},
+								),
 							));
-
-							Ok(EventState::Consumed)
 						}
-						_ => Ok(EventState::NotConsumed),
 					}
-				} else if e == self.key_config.move_down {
+					Ok(EventState::Consumed)
+				} else if key_match(
+					e,
+					self.key_config.keys.file_history,
+				) {
+					if let Some(status_item) = self.selection_file() {
+						self.hide();
+						if let Some(queue) = &self.queue {
+							queue.push(InternalEvent::OpenPopup(
+								StackablePopupOpen::FileRevlog(
+									FileRevOpen::new(
+										status_item.path,
+									),
+								),
+							));
+						}
+					}
+					Ok(EventState::Consumed)
+				} else if key_match(e, self.key_config.keys.edit_file)
+				{
+					if let Some(status_item) = self.selection_file() {
+						if let Some(queue) = &self.queue {
+							queue.push(
+								InternalEvent::OpenExternalEditor(
+									Some(status_item.path),
+								),
+							);
+						}
+					}
+					Ok(EventState::Consumed)
+				} else if key_match(e, self.key_config.keys.copy) {
+					self.copy_file_path();
+					Ok(EventState::Consumed)
+				} else if key_match(e, self.key_config.keys.move_down)
+				{
 					Ok(self
 						.move_selection(MoveSelection::Down)
 						.into())
-				} else if e == self.key_config.move_up {
+				} else if key_match(e, self.key_config.keys.move_up) {
 					Ok(self.move_selection(MoveSelection::Up).into())
-				} else if e == self.key_config.home
-					|| e == self.key_config.shift_up
+				} else if key_match(e, self.key_config.keys.home)
+					|| key_match(e, self.key_config.keys.shift_up)
 				{
 					Ok(self
 						.move_selection(MoveSelection::Home)
 						.into())
-				} else if e == self.key_config.end
-					|| e == self.key_config.shift_down
+				} else if key_match(e, self.key_config.keys.end)
+					|| key_match(e, self.key_config.keys.shift_down)
 				{
 					Ok(self.move_selection(MoveSelection::End).into())
-				} else if e == self.key_config.move_left {
+				} else if key_match(e, self.key_config.keys.move_left)
+				{
 					Ok(self
 						.move_selection(MoveSelection::Left)
 						.into())
-				} else if e == self.key_config.move_right {
+				} else if key_match(
+					e,
+					self.key_config.keys.move_right,
+				) {
 					Ok(self
 						.move_selection(MoveSelection::Right)
 						.into())
@@ -456,6 +552,19 @@ impl Component for FileTreeComponent {
 	fn focus(&mut self, focus: bool) {
 		self.focused = focus;
 		self.show_selection(focus);
+	}
+
+	fn is_visible(&self) -> bool {
+		self.visible
+	}
+
+	fn hide(&mut self) {
+		self.visible = false;
+	}
+
+	fn show(&mut self) -> Result<()> {
+		self.visible = true;
+		Ok(())
 	}
 }
 
@@ -490,13 +599,14 @@ mod tests {
 		//5    c1
 
 		// Set up test terminal
-		let test_backend = tui::backend::TestBackend::new(100, 100);
-		let mut terminal = tui::Terminal::new(test_backend)
+		let test_backend =
+			ratatui::backend::TestBackend::new(100, 100);
+		let mut terminal = ratatui::Terminal::new(test_backend)
 			.expect("Unable to set up terminal");
 		let mut frame = terminal.get_frame();
 
 		// set up file tree
-		let mut ftc = FileTreeComponent::new(
+		let mut ftc = StatusTreeComponent::new(
 			"title",
 			true,
 			None,
@@ -531,13 +641,14 @@ mod tests {
 		//5   d2
 
 		// Set up test terminal
-		let test_backend = tui::backend::TestBackend::new(100, 100);
-		let mut terminal = tui::Terminal::new(test_backend)
+		let test_backend =
+			ratatui::backend::TestBackend::new(100, 100);
+		let mut terminal = ratatui::Terminal::new(test_backend)
 			.expect("Unable to set up terminal");
 		let mut frame = terminal.get_frame();
 
 		// set up file tree
-		let mut ftc = FileTreeComponent::new(
+		let mut ftc = StatusTreeComponent::new(
 			"title",
 			true,
 			None,

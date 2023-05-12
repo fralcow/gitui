@@ -4,22 +4,25 @@ mod style;
 
 use super::{
 	command_pump, event_pump, CommandBlocking, CommandInfo,
-	Component, DrawableComponent, EventState, FileTreeComponent,
+	Component, DrawableComponent, EventState, StatusTreeComponent,
 };
 use crate::{
-	accessors, keys::SharedKeyConfig, queue::Queue, strings,
+	accessors,
+	keys::{key_match, SharedKeyConfig},
+	queue::Queue,
+	strings,
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
 use asyncgit::{
-	sync::CommitTags, AsyncCommitFiles, AsyncGitNotification,
-	CommitFilesParams,
+	sync::{CommitTags, RepoPathRef},
+	AsyncCommitFiles, AsyncGitNotification, CommitFilesParams,
 };
 use compare_details::CompareDetailsComponent;
 use crossbeam_channel::Sender;
 use crossterm::event::Event;
 use details::DetailsComponent;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Constraint, Direction, Layout, Rect},
 	Frame,
@@ -29,7 +32,7 @@ pub struct CommitDetailsComponent {
 	commit: Option<CommitFilesParams>,
 	single_details: DetailsComponent,
 	compare_details: CompareDetailsComponent,
-	file_tree: FileTreeComponent,
+	file_tree: StatusTreeComponent,
 	git_commit_files: AsyncCommitFiles,
 	visible: bool,
 	key_config: SharedKeyConfig,
@@ -40,6 +43,7 @@ impl CommitDetailsComponent {
 
 	///
 	pub fn new(
+		repo: &RepoPathRef,
 		queue: &Queue,
 		sender: &Sender<AsyncGitNotification>,
 		theme: SharedTheme,
@@ -47,16 +51,21 @@ impl CommitDetailsComponent {
 	) -> Self {
 		Self {
 			single_details: DetailsComponent::new(
+				repo.clone(),
 				theme.clone(),
 				key_config.clone(),
 				false,
 			),
 			compare_details: CompareDetailsComponent::new(
+				repo.clone(),
 				theme.clone(),
 				false,
 			),
-			git_commit_files: AsyncCommitFiles::new(sender),
-			file_tree: FileTreeComponent::new(
+			git_commit_files: AsyncCommitFiles::new(
+				repo.borrow().clone(),
+				sender,
+			),
+			file_tree: StatusTreeComponent::new(
 				"",
 				false,
 				Some(queue.clone()),
@@ -83,7 +92,7 @@ impl CommitDetailsComponent {
 	pub fn set_commits(
 		&mut self,
 		params: Option<CommitFilesParams>,
-		tags: Option<CommitTags>,
+		tags: &Option<CommitTags>,
 	) -> Result<()> {
 		if params.is_none() {
 			self.single_details.set_commit(None, None);
@@ -93,11 +102,14 @@ impl CommitDetailsComponent {
 		self.commit = params;
 
 		if let Some(id) = params {
+			self.file_tree.set_commit(Some(id.id));
+
 			if let Some(other) = id.other {
 				self.compare_details
 					.set_commits(Some((id.id, other)));
 			} else {
-				self.single_details.set_commit(Some(id.id), tags);
+				self.single_details
+					.set_commit(Some(id.id), tags.clone());
 			}
 
 			if let Some((fetched_id, res)) =
@@ -126,7 +138,7 @@ impl CommitDetailsComponent {
 	}
 
 	///
-	pub const fn files(&self) -> &FileTreeComponent {
+	pub const fn files(&self) -> &StatusTreeComponent {
 		&self.file_tree
 	}
 
@@ -154,6 +166,10 @@ impl DrawableComponent for CommitDetailsComponent {
 		f: &mut Frame<B>,
 		rect: Rect,
 	) -> Result<()> {
+		if !self.visible {
+			return Ok(());
+		}
+
 		let constraints = if self.is_compare() {
 			[Constraint::Length(10), Constraint::Min(0)]
 		} else {
@@ -205,22 +221,26 @@ impl Component for CommitDetailsComponent {
 		CommandBlocking::PassingOn
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if event_pump(ev, self.components_mut().as_mut_slice())?
 			.is_consumed()
 		{
+			if !self.file_tree.is_visible() {
+				self.hide();
+			}
+
 			return Ok(EventState::Consumed);
 		}
 
 		if self.focused() {
 			if let Event::Key(e) = ev {
-				return if e == self.key_config.focus_below
+				return if key_match(e, self.key_config.keys.move_down)
 					&& self.details_focused()
 				{
 					self.set_details_focus(false);
 					self.file_tree.focus(true);
 					Ok(EventState::Consumed)
-				} else if e == self.key_config.focus_above
+				} else if key_match(e, self.key_config.keys.move_up)
 					&& self.file_tree.focused()
 					&& !self.is_compare()
 				{
@@ -244,6 +264,7 @@ impl Component for CommitDetailsComponent {
 	}
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
+		self.file_tree.show()?;
 		Ok(())
 	}
 

@@ -3,7 +3,7 @@ use crate::{
 		cred::CredComponent, visibility_blocking, CommandBlocking,
 		CommandInfo, Component, DrawableComponent, EventState,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, Queue},
 	strings::{self},
 	ui::{self, style::SharedTheme},
@@ -16,12 +16,13 @@ use asyncgit::{
 			BasicAuthCredential,
 		},
 		get_default_remote, AsyncProgress, PushTagsProgress,
+		RepoPathRef,
 	},
-	AsyncGitNotification, AsyncPushTags, PushTagsRequest, CWD,
+	AsyncGitNotification, AsyncPushTags, PushTagsRequest,
 };
 use crossbeam_channel::Sender;
 use crossterm::event::Event;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::Rect,
 	text::Span,
@@ -31,6 +32,7 @@ use tui::{
 
 ///
 pub struct PushTagsComponent {
+	repo: RepoPathRef,
 	visible: bool,
 	git_push: AsyncPushTags,
 	progress: Option<PushTagsProgress>,
@@ -44,16 +46,21 @@ pub struct PushTagsComponent {
 impl PushTagsComponent {
 	///
 	pub fn new(
+		repo: &RepoPathRef,
 		queue: &Queue,
 		sender: &Sender<AsyncGitNotification>,
 		theme: SharedTheme,
 		key_config: SharedKeyConfig,
 	) -> Self {
 		Self {
+			repo: repo.clone(),
 			queue: queue.clone(),
 			pending: false,
 			visible: false,
-			git_push: AsyncPushTags::new(sender),
+			git_push: AsyncPushTags::new(
+				repo.borrow().clone(),
+				sender,
+			),
 			progress: None,
 			input_cred: CredComponent::new(
 				theme.clone(),
@@ -67,9 +74,9 @@ impl PushTagsComponent {
 	///
 	pub fn push_tags(&mut self) -> Result<()> {
 		self.show()?;
-		if need_username_password()? {
-			let cred =
-				extract_username_password().unwrap_or_else(|_| {
+		if need_username_password(&self.repo.borrow())? {
+			let cred = extract_username_password(&self.repo.borrow())
+				.unwrap_or_else(|_| {
 					BasicAuthCredential::new(None, None)
 				});
 			if cred.is_complete() {
@@ -90,7 +97,7 @@ impl PushTagsComponent {
 		self.pending = true;
 		self.progress = None;
 		self.git_push.request(PushTagsRequest {
-			remote: get_default_remote(CWD)?,
+			remote: get_default_remote(&self.repo.borrow())?,
 			basic_credential: cred,
 		})?;
 		Ok(())
@@ -116,7 +123,7 @@ impl PushTagsComponent {
 		if !self.pending {
 			if let Some(err) = self.git_push.last_result()? {
 				self.queue.push(InternalEvent::ShowErrorMsg(
-					format!("push tags failed:\n{}", err),
+					format!("push tags failed:\n{err}"),
 				));
 			}
 			self.hide();
@@ -220,7 +227,7 @@ impl Component for PushTagsComponent {
 		visibility_blocking(self)
 	}
 
-	fn event(&mut self, ev: Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
 			if let Event::Key(e) = ev {
 				if self.input_cred.is_visible() {
@@ -234,8 +241,10 @@ impl Component for PushTagsComponent {
 						))?;
 						self.input_cred.hide();
 					}
-				} else if e == self.key_config.exit_popup
-					&& !self.pending
+				} else if key_match(
+					e,
+					self.key_config.keys.exit_popup,
+				) && !self.pending
 				{
 					self.hide();
 				}

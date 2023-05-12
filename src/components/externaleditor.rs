@@ -8,25 +8,24 @@ use crate::{
 	ui::{self, style::SharedTheme},
 };
 use anyhow::{anyhow, bail, Result};
-use asyncgit::{
-	sync::{get_config_string, utils::repo_work_dir},
-	CWD,
+use asyncgit::sync::{
+	get_config_string, utils::repo_work_dir, RepoPath,
 };
 use crossterm::{
 	event::Event,
 	terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 	ExecutableCommand,
 };
-use scopeguard::defer;
-use std::ffi::OsStr;
-use std::{env, io, path::Path, process::Command};
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::Rect,
 	text::{Span, Spans},
 	widgets::{Block, BorderType, Borders, Clear, Paragraph},
 	Frame,
 };
+use scopeguard::defer;
+use std::ffi::OsStr;
+use std::{env, io, path::Path, process::Command};
 
 ///
 pub struct ExternalEditorComponent {
@@ -49,8 +48,11 @@ impl ExternalEditorComponent {
 	}
 
 	/// opens file at given `path` in an available editor
-	pub fn open_file_in_editor(path: &Path) -> Result<()> {
-		let work_dir = repo_work_dir(CWD)?;
+	pub fn open_file_in_editor(
+		repo: &RepoPath,
+		path: &Path,
+	) -> Result<()> {
+		let work_dir = repo_work_dir(repo)?;
 
 		let path = if path.is_relative() {
 			Path::new(&work_dir).join(path)
@@ -71,7 +73,9 @@ impl ExternalEditorComponent {
 
 		let editor = env::var(environment_options[0])
 			.ok()
-			.or_else(|| get_config_string(CWD, "core.editor").ok()?)
+			.or_else(|| {
+				get_config_string(repo, "core.editor").ok()?
+			})
 			.or_else(|| env::var(environment_options[1]).ok())
 			.or_else(|| env::var(environment_options[2]).ok())
 			.unwrap_or_else(|| String::from("vi"));
@@ -166,7 +170,7 @@ impl Component for ExternalEditorComponent {
 		visibility_blocking(self)
 	}
 
-	fn event(&mut self, _ev: Event) -> Result<EventState> {
+	fn event(&mut self, _ev: &Event) -> Result<EventState> {
 		if self.visible {
 			return Ok(EventState::Consumed);
 		}

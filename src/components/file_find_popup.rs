@@ -3,7 +3,7 @@ use super::{
 	DrawableComponent, EventState, ScrollType, TextInputComponent,
 };
 use crate::{
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, Queue},
 	string_utils::trim_length_left,
 	strings,
@@ -13,14 +13,14 @@ use anyhow::Result;
 use asyncgit::sync::TreeFile;
 use crossterm::event::Event;
 use fuzzy_matcher::FuzzyMatcher;
-use std::borrow::Cow;
-use tui::{
+use ratatui::{
 	backend::Backend,
 	layout::{Constraint, Direction, Layout, Margin, Rect},
-	text::Span,
+	text::{Span, Spans},
 	widgets::{Block, Borders, Clear},
 	Frame,
 };
+use std::borrow::Cow;
 
 pub struct FileFindPopup {
 	queue: Queue,
@@ -31,7 +31,7 @@ pub struct FileFindPopup {
 	files: Vec<TreeFile>,
 	selection: usize,
 	selected_index: Option<usize>,
-	files_filtered: Vec<usize>,
+	files_filtered: Vec<(usize, Vec<usize>)>,
 	key_config: SharedKeyConfig,
 }
 
@@ -88,13 +88,25 @@ impl FileFindPopup {
 			let matcher =
 				fuzzy_matcher::skim::SkimMatcherV2::default();
 
-			self.files_filtered.extend(
-				self.files.iter().enumerate().filter_map(|a| {
+			let mut files = self
+				.files
+				.iter()
+				.enumerate()
+				.filter_map(|a| {
 					a.1.path.to_str().and_then(|path| {
-						//TODO: use fuzzy_indices and highlight hits
-						matcher.fuzzy_match(path, q).map(|_| a.0)
+						matcher.fuzzy_indices(path, q).map(
+							|(score, indices)| (score, a.0, indices),
+						)
 					})
-				}),
+				})
+				.collect::<Vec<(_, _, _)>>();
+
+			files.sort_by(|(score1, _, _), (score2, _, _)| {
+				score2.cmp(score1)
+			});
+
+			self.files_filtered.extend(
+				files.into_iter().map(|entry| (entry.1, entry.2)),
 			);
 		}
 
@@ -104,7 +116,7 @@ impl FileFindPopup {
 
 	fn refresh_selection(&mut self) {
 		let selection =
-			self.files_filtered.get(self.selection).copied();
+			self.files_filtered.get(self.selection).map(|a| a.0);
 
 		if self.selected_index != selection {
 			self.selected_index = selection;
@@ -187,8 +199,7 @@ impl DrawableComponent for FileFindPopup {
 					.borders(Borders::all())
 					.style(self.theme.title(true))
 					.title(Span::styled(
-						//TODO: strings
-						"Fuzzy find",
+						strings::POPUP_TITLE_FUZZY_FIND,
 						self.theme.title(true),
 					)),
 				area,
@@ -217,24 +228,36 @@ impl DrawableComponent for FileFindPopup {
 				let height = usize::from(chunks[1].height);
 				let width = usize::from(chunks[1].width);
 
-				let items =
-					self.files_filtered.iter().take(height).map(
-						|idx| {
-							let selected = self
-								.selected_index
-								.map_or(false, |index| index == *idx);
-							Span::styled(
-								Cow::from(trim_length_left(
-									self.files[*idx]
-										.path
-										.to_str()
-										.unwrap_or_default(),
-									width,
-								)),
-								self.theme.text(selected, false),
-							)
-						},
-					);
+				let items = self
+					.files_filtered
+					.iter()
+					.take(height)
+					.map(|(idx, indicies)| {
+						let selected = self
+							.selected_index
+							.map_or(false, |index| index == *idx);
+						let full_text = trim_length_left(
+							self.files[*idx]
+								.path
+								.to_str()
+								.unwrap_or_default(),
+							width,
+						);
+						Spans::from(
+							full_text
+								.char_indices()
+								.map(|(c_idx, c)| {
+									Span::styled(
+										Cow::from(c.to_string()),
+										self.theme.text(
+											selected,
+											indicies.contains(&c_idx),
+										),
+									)
+								})
+								.collect::<Vec<_>>(),
+						)
+					});
 
 				ui::draw_list_block(
 					f,
@@ -260,17 +283,16 @@ impl Component for FileFindPopup {
 		force_all: bool,
 	) -> CommandBlocking {
 		if self.is_visible() || force_all {
-			out.push(
-				CommandInfo::new(
-					strings::commands::close_popup(&self.key_config),
-					true,
-					true,
-				)
-				.order(1),
-			);
+			out.push(CommandInfo::new(
+				strings::commands::scroll_popup(&self.key_config),
+				true,
+				true,
+			));
 
 			out.push(CommandInfo::new(
-				strings::commands::scroll(&self.key_config),
+				strings::commands::close_fuzzy_finder(
+					&self.key_config,
+				),
 				true,
 				true,
 			));
@@ -281,17 +303,23 @@ impl Component for FileFindPopup {
 
 	fn event(
 		&mut self,
-		event: crossterm::event::Event,
+		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
-			if let Event::Key(key) = &event {
-				if *key == self.key_config.exit_popup
-					|| *key == self.key_config.enter
+			if let Event::Key(key) = event {
+				if key_match(key, self.key_config.keys.exit_popup)
+					|| key_match(key, self.key_config.keys.enter)
 				{
 					self.hide();
-				} else if *key == self.key_config.move_down {
+				} else if key_match(
+					key,
+					self.key_config.keys.popup_down,
+				) {
 					self.move_selection(ScrollType::Down);
-				} else if *key == self.key_config.move_up {
+				} else if key_match(
+					key,
+					self.key_config.keys.popup_up,
+				) {
 					self.move_selection(ScrollType::Up);
 				}
 			}

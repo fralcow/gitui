@@ -2,7 +2,8 @@ use asyncgit::sync::{CommitId, CommitInfo};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, Utc};
 use std::slice::Iter;
 
-use crate::components::utils::emojifi_string;
+#[cfg(feature = "ghemoji")]
+use super::emoji::emojifi_string;
 
 static SLICE_OFFSET_RELOAD_THRESHOLD: usize = 100;
 
@@ -21,22 +22,32 @@ pub struct LogEntry {
 
 impl From<CommitInfo> for LogEntry {
 	fn from(c: CommitInfo) -> Self {
-		let time =
+		let hash_short = c.id.get_short_string().into();
+
+		let time = {
+			let date = NaiveDateTime::from_timestamp_opt(c.time, 0);
+			if date.is_none() {
+				log::error!("error reading commit date: {hash_short} - timestamp: {}",c.time);
+			}
 			DateTime::<Local>::from(DateTime::<Utc>::from_utc(
-				NaiveDateTime::from_timestamp(c.time, 0),
+				date.unwrap_or_default(),
 				Utc,
-			));
+			))
+		};
+
+		let author = c.author;
+		#[allow(unused_mut)]
+		let mut msg = c.message;
 
 		// Replace markdown emojis with Unicode equivalent
-		let author = c.author;
-		let mut msg = c.message;
+		#[cfg(feature = "ghemoji")]
 		emojifi_string(&mut msg);
 
 		Self {
 			author: author.into(),
 			msg: msg.into(),
 			time,
-			hash_short: c.id.get_short_string().into(),
+			hash_short,
 			id: c.id,
 		}
 	}
@@ -51,8 +62,8 @@ impl LogEntry {
 			} else {
 				format!("{:0>2}m ago", delta.num_minutes())
 			};
-			format!("{: <10}", delta_str)
-		} else if self.time.date() == now.date() {
+			format!("{delta_str: <10}")
+		} else if self.time.date_naive() == now.date_naive() {
 			self.time.format("%T  ").to_string()
 		} else {
 			self.time.format("%Y-%m-%d").to_string()
@@ -113,6 +124,7 @@ impl ItemBatch {
 }
 
 #[cfg(test)]
+#[cfg(feature = "ghemoji")]
 mod tests {
 	use super::*;
 
